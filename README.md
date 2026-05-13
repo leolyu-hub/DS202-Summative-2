@@ -22,14 +22,13 @@ at the end.
 | 2. Stratified sampling | 15-strata proportional design, n = 150,000 | §3.1 |
 | 3. Text preprocessing | stopword removal + spaCy lemmatisation | §3.2 |
 | 4. Vectorisation | TF-IDF, separate fits for pros / cons | §3.3 |
-| 5. Dimensionality reduction | TruncatedSVD → 100 dims per field; hstack → 200 dims; double L2 normalisation | §3.4 |
-| 6. Semantic-space structure | 3-D LSA projection coloured by rating / period / company type | §3.5 |
-| 7. Firm similarity | Centroid cosine similarity in 200-dim joint LSA space | §4 |
-| 8. Anomaly detection | Isolation Forest | §5.1 |
-| 9. Topic discovery | BERTopic (all-MiniLM-L6-v2 → UMAP → HDBSCAN min_cluster_size=200, min_samples=25) | §8.1–§8.2 |
-| 10. Topic period analysis | COVID-excess per topic; enriched / depleted topics | §8.3 |
-| 11. Term-level temporal shift | Log-ratio vocabulary comparison, pre-COVID (2008–19) vs COVID (2020–21) | §8.4 |
-| 12. Sentiment by period | Text valence (1–5 scale) by period | §8.5 |
+| 5. Latent Semantic Analysis (LSA) | TruncatedSVD → double L2 normalisation → 3-D LSA projection| §3.4-§3.5 |
+| 6. Firm similarity | Centroid cosine similarity in 200-dim joint LSA space | §4 |
+| 7. Anomaly detection | Isolation Forest | §5.1 |
+| 8. Topic discovery | BERTopic (all-MiniLM-L6-v2 → UMAP → HDBSCAN) | §8.1–§8.2 |
+| 9. Topic period analysis | COVID-excess per topic; enriched / depleted topics | §8.3 |
+| 10. Term-level temporal shift | Log-ratio vocabulary comparison, pre-COVID (2008–19) vs COVID (2020–21) | §8.4 |
+| 11. Sentiment by period | Text valence (1–5 scale) by period | §8.5 |
 
 ## Files
 
