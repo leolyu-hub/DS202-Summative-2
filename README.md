@@ -20,7 +20,7 @@ at the end.
 |---|---|---|
 | 1. EDA overview | Rating / temporal / company / industry distributions | §1 |
 | 2. Stratified sampling | 15-strata proportional design, n = 150,000 | §3.1 |
-| 3. Text preprocessing | stopword removal + spaCy lemmatisation | §3.2 |
+| 3. Text preprocessing | Stopword removal + spaCy lemmatisation | §3.2 |
 | 4. Vectorisation | TF-IDF, separate fits for pros / cons | §3.3 |
 | 5. Latent Semantic Analysis (LSA) | TruncatedSVD → double L2 normalisation → 3-D LSA projection| §3.4-§3.5 |
 | 6. Firm similarity | Centroid cosine similarity in 200-dim joint LSA space | §4 |
