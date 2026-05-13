@@ -1,0 +1,2390 @@
+---
+title: "DS202W - Spring Term Summative"
+author: "60775"
+format:
+  html:
+    html-math-method: katex
+self-contained: true
+jupyter: python3
+engine: jupyter
+execute:
+  cache: true
+editor:
+  render-on-save: true
+  preview: true
+---
+# Setup
+```{python}
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import seaborn as sns
+from collections import Counter
+from pathlib import Path
+import re
+import warnings
+from wordcloud import WordCloud
+
+try:
+    import missingno as msno
+    MSNO_AVAILABLE = True
+except ImportError:
+    MSNO_AVAILABLE = False
+    print("missingno not installed; skipping missingness matrix.")
+
+
+warnings.filterwarnings("ignore")
+
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.preprocessing import normalize, MinMaxScaler
+from sklearn.metrics.pairwise import cosine_similarity as sk_cosine, cosine_distances
+
+# spaCy for lemmatisation (Part A §3.2) 
+import spacy
+
+DATA_CANDIDATES = [
+    Path("data") / "glassdoor_reviews.csv",
+    Path("glassdoor_reviews.csv"),
+]
+DATA_PATH = next((path for path in DATA_CANDIDATES if path.exists()), None)
+if DATA_PATH is None:
+    raise FileNotFoundError(
+        "Expected `glassdoor_reviews.csv` in `data/` or the project root."
+    )
+
+try:
+    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+    SPACY_SOURCE = "en_core_web_sm"
+except OSError:
+    nlp = spacy.blank("en")
+    SPACY_SOURCE = "spacy.blank('en') fallback"
+
+def clean_text(text):
+    """Tokenise, lemmatise, and remove stopwords/punctuation/short tokens."""
+    doc = text if hasattr(text, "to_array") else nlp(str(text).lower())
+    cleaned = []
+    for token in doc:
+        lemma = token.lemma_.lower().strip() if token.lemma_ else token.text.lower()
+        if lemma in {"", "-pron-"}:
+            lemma = token.text.lower()
+        if token.is_alpha and not token.is_stop and len(lemma) > 2:
+            cleaned.append(lemma)
+    return cleaned
+
+def raw_alpha_tokens(text):
+    """Fast regex tokeniser for raw frequency diagnostics."""
+    return re.findall(r"[a-z]{3,}", str(text).lower())
+
+def normalise_firm_name(name):
+    return re.sub(r"[^A-Za-z0-9]+", "", str(name)).upper()
+
+print(f"Loaded dataset from: {DATA_PATH}")
+print(f"spaCy pipeline: {SPACY_SOURCE}")
+
+# scipy: statistical validation 
+from scipy.stats import chisquare
+
+# plotly: interactive 3D LSA visualisation 
+import plotly.express as px
+
+# BERTopic pipeline dependencies 
+# Setup requirement (offline marking environments): the four packages below
+# (bertopic, sentence-transformers, hdbscan, umap-learn) are required for Part B
+# (§8) and must be present in the Python environment before this notebook is
+# rendered. The first-run installer below uses pip and therefore requires
+# internet access; a pre-prepared environment (e.g. via the requirements list
+# in the README) is the recommended path. If the environment already has the
+# packages, the try/except short-circuits and no network call is made.
+import subprocess, sys
+for pkg, import_name in [
+    ('bertopic',              'bertopic'),
+    ('sentence_transformers', 'sentence_transformers'),
+    ('hdbscan',               'hdbscan'),
+    ('umap-learn',            'umap'),
+]:
+    try:
+        __import__(import_name)
+    except ImportError:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'], check=True)
+
+# BERTopic pipeline (Part B §8) 
+from bertopic               import BERTopic
+from hdbscan                import HDBSCAN as HDBSCANModel
+from sentence_transformers  import SentenceTransformer
+from umap                   import UMAP as UMAPModel
+
+```
+
+# Part A: Similarity and Anomalies
+
+## 1 Introduction
+
+### 1.1 Dataset inspection
+
+This report investigates what is **normal** and what is **unusual** in how employees describe their workplaces, using 838,566 Glassdoor reviews from 428 major employers collected between 2008 and 2021. Each review contains separate free-text fields for the "pros" and "cons" of working at a company, alongside structured ratings for overall satisfaction, work-life balance, career opportunities, and senior management.
+
+The analysis is organised around two complementary questions:
+
+1. **Similarity**, which reviews resemble one another, and what shared patterns does this reveal about how employees collectively talk about work?
+2. **Anomaly**, which reviews are linguistically unusual, and what do these exceptional cases tell us about the edges of workplace experience?
+
+These are not the same question. A document can be highly similar to many others while still being anomalous relative to the full corpus, or vice versa. The precise operational definitions of both concepts depend on the structure of the data itself, the text length distribution, the degree of sparsity in the vector representations, the concentration of reviews across firms, and the relationship between ratings and language. Section 1 therefore focuses on establishing those empirical properties before any analytical choices are committed to. The definitions that follow in Section 2 are grounded in what the data inspection reveals rather than imposed a priori.
+
+**Stakeholder framing.** Part A briefs three audiences. 
+(i) Glassdoor's trust team — §6 shows corpus-wide anomaly detection systematically over-flags employers with distinctive in-house vocabulary (a fairness problem disguised as fraud detection). 
+
+(ii) HR / employer-brand teams — §4 shows within-firm cohesion varies firm-by-firm, and high cohesion can indicate a narrow workforce as readily as a healthy culture.
+
+(iii) Job-seekers and researchers — §5's rating–text divergence bounds how much a 5★ rating can be trusted as a summary of review content.
+
+### Reproducibility note
+
+To reproduce this analysis, place a local copy named `glassdoor_reviews.csv` in `DATA_PATH`  or in the project root. The setup chunk searches those two locations and prints the path it used. All analyses in both Part A and Part B then derive from that same file.
+
+Because the raw corpus is large, I fit the computationally heavier models on a **stratified sample of ≈150,000 reviews** (the actual row count printed by the sampling cell is 150,001, the +1 reflects rounding inside the per-stratum quota assignment; for prose readability the sample is referred to throughout as "150,000") rather than on all 838,566 rows. Justification is stated after the initial dataset overview. The full dataset is still used for inspection, descriptive checks, and for motivating the sampling design.
+
+```{python}
+df = pd.read_csv(DATA_PATH)
+df['firm_key'] = df['firm'].map(normalise_firm_name)
+```
+
+#### 1.1.1 Dataset overview and missingness
+```{python}
+#| label: data-overview
+
+print(f"\nCORPUS SCOPE:")
+print(f"  Total reviews:        {len(df):>12,}")
+print(f"  Date range:           {df['date_review'].min()} to {df['date_review'].max()}")
+print(f"  Time span:            ~{(pd.to_datetime(df['date_review'].max()) - pd.to_datetime(df['date_review'].min())).days // 365} years")
+print(f"  Unique companies:     {df['firm'].nunique():>12,}")
+print(f"\nDATA STRUCTURE:")
+print(f"  Columns:              {len(df.columns)}")
+print(f"  Shape:                {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+# Column overview and missingness 
+print(f"\n--- Column Inventory ---")
+print(f"  {'Column':<20} {'Type':<15} {'Non-null':<15} {'Missing':<10}")
+print("  " + "-" * 62)
+
+for col in df.columns:
+    dtype_str = str(df[col].dtype)
+    non_null = df[col].notna().sum()
+    missing_pct = (1 - non_null / len(df)) * 100
+    
+    if missing_pct > 0:
+        missing_str = f"{missing_pct:.1f}%"
+    else:
+        missing_str = "—"
+    
+    print(f"  {col:<20} {dtype_str:<15} {non_null:<15,} {missing_str:<10}")
+
+
+if MSNO_AVAILABLE:
+    fig, ax = plt.subplots(figsize=(16, 6))
+    msno.matrix(df, ax=ax, sparkline=False, fontsize=7)
+    ax.set_title("Missingness is concentrated in optional sub-rating fields; core text fields are near-complete", fontsize=12, pad=12)
+    plt.tight_layout()
+    plt.show()
+
+```
+
+The dataset contains 18 columns spanning three categories: **firm identifiers** (`firm`, `job_title`, `location`), **text fields** (`pros`, `cons`, `headline`), **structured ratings** (`overall_rating` plus the sub-ratings), and **metadata** (`date_review`, `recommend`, `ceo_approv`, `outlook`, and reviewer status).
+
+**Primary text fields are near-complete**: The extremely low missing rates for `pros` and `cons` could be because users perceived no notable advantages or disadvantages, or the Glassdoor system might have encountered errors when entering this text, suggesting that the complete absence was random. These gaps are handled by converting `NaN` to empty strings before vectorisation, ensuring no rows are dropped from the analysis.
+
+**Moderate missingness in sub-ratings**: The structured sub-rating fields each have roughly one-in-five values missing. This may be caused by reviewers who gave an overall score without completing the detailed breakdown. These fields are used only as supplementary validation signals in the anomaly analysis, not as primary inputs, so their missingness does not compromise the core text modelling.
+
+Diversity_inclusion is missing for 83.8% of rows. It is therefore excluded from all analyses since it is too sparse to provide meaningful signal.
+
+`location` has 35.5% missing values and is used only where available. As metadata, it is not a primary feature for similarity or anomaly detection.
+
+### 1.2 Text field characteristics (pros, cons and overall_rating)
+```{python}
+#| label: text field characteristics
+
+# Text length
+df['pros_words'] = df['pros'].fillna('').str.split().str.len()
+df['cons_words'] = df['cons'].fillna('').str.split().str.len()
+df['total_words'] = df['pros_words'] + df['cons_words']
+
+print(f"\n--- Text length statistics (words) ---")
+print(f"  {'Field':<15} {'Min':<8} {'Q1':<8} {'Median':<10} {'Mean':<10} {'Q3':<8} {'Max':<8}")
+print("  " + "-" * 70)
+
+for field, col in [('Pros', 'pros_words'), ('Cons', 'cons_words'), ('Combined', 'total_words')]:
+    q = df[col].quantile([0, 0.25, 0.5, 0.75, 1.0])
+    print(f"  {field:<15} {q[0]:<8.0f} {q[0.25]:<8.0f} {q[0.5]:<10.0f} {df[col].mean():<10.1f} {q[0.75]:<8.0f} {q[1.0]:<8.0f}")
+
+
+# Visualization: Text length distribution (clipped for readability)
+
+CLIP = 200  # Clip at 200 to show the bulk of the distribution while keeping the long tail interpretable
+
+fig, ax = plt.subplots(figsize=(10, 4))
+
+ax.hist(df['total_words'].clip(upper=CLIP), bins=80,
+        color='#4C9BE8', edgecolor='white', alpha=0.85)
+
+ax.axvline(df['total_words'].median(), color='red', linestyle='--',
+           linewidth=1.8, label=f"Median = {int(df['total_words'].median())} words")
+ax.axvline(df['total_words'].mean(), color='orange', linestyle='--',
+           linewidth=1.8, label=f"Mean = {df['total_words'].mean():.1f} words")
+
+
+# Shade the IQR region
+ax.axvspan(df['total_words'].quantile(0.25),
+           df['total_words'].quantile(0.75),
+           alpha=0.08, color='red', label=f"IQR ({int(df['total_words'].quantile(0.25))}–{int(df['total_words'].quantile(0.75))} words)")
+
+# Annotate the long-tail clipping
+pct_clipped = (df['total_words'] > CLIP).mean() * 100
+ax.text(CLIP * 0.88, ax.get_ylim()[1] * 0.85,
+        f'{pct_clipped:.1f}% of reviews\nexceed {CLIP} words\n(not shown)',
+        fontsize=8.5, color='gray', ha='center',
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='gray', alpha=0.7))
+
+ax.set_xlabel('Total words (pros + cons)', fontsize=11)
+ax.set_ylabel('Number of reviews', fontsize=11)
+ax.set_title('Reviews are short: median ≈ 20 words — motivating n-grams and LSA over raw BoW', fontsize=12, fontweight='bold')
+ax.set_xlim(0, CLIP)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x/1000)}k'))
+ax.legend(fontsize=9)
+ax.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print(f"  Reviews ≤ 50 words: {(df['total_words'] <= 50).mean()*100:.1f}%")
+print(f"  Reviews > 200 words: {(df['total_words'] > 200).mean()*100:.1f}%")
+
+# ── Rating distribution of the full corpus ────────────────────────────────────
+rating_counts = df['overall_rating'].value_counts().sort_index()
+pct_4_5 = (rating_counts[4] + rating_counts[5]) / len(df) * 100
+
+fig2, ax2 = plt.subplots(figsize=(7, 4))
+colors_rg = sns.color_palette("RdYlGn", 5)
+bars2 = ax2.bar(rating_counts.index, rating_counts.values, color=colors_rg, edgecolor='white')
+ax2.set_xlabel('Overall rating', fontsize=11)
+ax2.set_ylabel('Number of reviews', fontsize=11)
+ax2.set_title(f'Overall rating distribution (full corpus)\n{pct_4_5:.1f}% of reviews are rated 4★ or 5★',
+              fontsize=12, fontweight='bold')
+ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x/1000)}k'))
+for bar, val in zip(bars2, rating_counts.values):
+    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 3000,
+             f'{val/len(df)*100:.1f}%', ha='center', fontsize=9, fontweight='bold')
+ax2.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+print(f"  Rating skew: {pct_4_5:.1f}% of reviews are 4★ or 5★")
+```
+
+The combined review length distribution is **strongly right-skewed**. The median review is **only 19 words combined** (9 words each for pros and cons). The interquartile range spans 13–40 words. More than **four in five reviews** fall below 50 combined words. The long right tail extends to 3,200+ words, but **only about 1.5% of reviews exceed 200 words**.
+
+This brevity matters for both the modelling and sampling choices used below. On the modelling side, the short-text structure motivates two downstream choices (detailed in §3): applying document-frequency thresholds to remove terms that are too rare or too common to discriminate, and using LSA dimensionality reduction to capture latent patterns of term association that raw term counts cannot reveal reliably in short documents. On the sampling side, the strong positivity skew (over 60% of reviews are rated 4 or 5 stars) means a purely random draw would under-represent negative reviews, this is addressed by the rating-stratified design described in §3.1. A further motivation for keeping the working sample at ≈150,000 reviews rather than the full 838k is specific to the anomaly detection method: Isolation Forest performs best on smaller, balanced samples. With very large inputs, the dense mass of normal instances occupies most of the tree depth, causing genuine anomalies near the cluster boundary to require an unrealistically large number of random splits, a problem known as **masking**. The stratified sample substantially reduces this risk and keeps tree depth interpretable.
+
+### 1.3 Temporal distribution
+```{python}
+#| label: temporal distribution
+
+# Timeline for the full dataset
+df['year_review'] = pd.to_datetime(df['date_review']).dt.year
+year_counts = df['year_review'].value_counts().sort_index()
+
+print(f"\nReviews by year:")
+for year in sorted(df['year_review'].unique()):
+    count = year_counts[year]
+    pct = count / len(df) * 100
+    bar = "█" * int(pct / 2)  # Scale for visual representation
+    print(f"  {year}: {count:>8,} ({pct:>5.1f}%)  {bar}")
+
+# Visualization: Timeline
+fig, ax = plt.subplots(figsize=(13, 4))
+
+year_counts.plot(kind='bar', ax=ax, color='#4C9BE8', edgecolor='white', width=0.7)
+ax.set_xlabel('Year', fontsize=11)
+ax.set_ylabel('Number of reviews', fontsize=11)
+ax.set_title('Review volume is heavily recency-weighted — 70% of the corpus falls after 2015', fontsize=12, fontweight='bold')
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x/1000)}k'))
+ax.grid(axis='y', alpha=0.3)
+
+# Highlight major periods
+ax.axvspan(-0.5,  7.5, alpha=0.1, color='gray',      label='Early phase (2008–2015)')
+ax.axvspan( 7.5, 11.5, alpha=0.1, color='steelblue', label='Platform maturity (2016–2019)')
+ax.axvspan(11.5, 13.5, alpha=0.1, color='red',       label='COVID-19 period (2020–2021)')
+
+# Per-year count labels above each bar
+for b in ax.patches:
+    ax.text(b.get_x() + b.get_width()/2, b.get_height(),
+            f'{int(b.get_height()):,}', ha='center', va='bottom', fontsize=8)
+ax.set_ylim(0, ax.get_ylim()[1] * 1.10)
+
+ax.legend(loc='upper left')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+```
+
+The review submission timeline reveals three distinct phases. The **early phase (2008–2015)** is sparse, contributing only 12.9% of all reviews (fewer than 40k per year), reflecting Glassdoor's limited platform adoption in its first years. The 2015 boundary corresponds to Glassdoor achieving unicorn valuation and launching in Germany and the Netherlands, triggering a visible step-change in annual review volume. The **platform maturity period (2016–2019)** sees a sharp acceleration, with annual volumes stabilising between 70k and 103k reviews (44.1% of the corpus). Most strikingly, **2020–2021 alone account for 33.9% of all reviews** (140k and 145k respectively). That spike coincides with the COVID-19 period and the associated labour-market shock, when remote work, layoffs, and job insecurity became unusually salient.
+
+This **recency bias** has a direct implication for sampling. A simple random draw would disproportionately reflect pandemic-era language such as "remote", "work from home", and "job security", and would under-represent the pre-2020 vocabulary of a structurally different labour market. This is exactly what motivates the **15-strata period × rating proportional sampling design** implemented in §3.1: stratifying jointly on the three temporal periods (Early 2008–15, Mature 2016–19, COVID 2020–21) and the five rating tiers preserves the natural shape of the corpus on both axes simultaneously, so neither the rating skew nor the recency-weighting is artificially flattened. The downstream similarity measure (§2.1) is defined as temporally agnostic — it compares vocabulary regardless of when reviews were written — but Part B's research question explicitly exploits the period dimension and so requires that the sample retain the period structure of the population, which the 15-strata design delivers.
+
+### 1.4 Company distribution
+```{python}
+#| label: company distribution
+
+firm_counts = df['firm'].value_counts()
+
+print(f"\nCompany coverage:")
+print(f"  Total unique firms:   {df['firm'].nunique():>8,}")
+print(f"  Reviews per firm:")
+print(f"    Min:                {firm_counts.min():>8,}")
+print(f"    Median:             {firm_counts.median():>8.0f}")
+print(f"    Mean:               {firm_counts.mean():>8.1f}")
+print(f"    Max:                {firm_counts.max():>8,}")
+
+print(f"\n  Top 10 companies by review volume:")
+for i, (firm, count) in enumerate(firm_counts.head(10).items(), 1):
+    pct = count / len(df) * 100
+    print(f"    {i:<2}. {firm:<30} {count:>6,} ({pct:>4.1f}%)")
+
+print("\n" + "=" * 75)
+
+```
+
+The 428 firms follow a **power-law distribution** (min: 1, median: 309, mean: 1,959, max: 60,436). IBM dominates with 60,436 reviews (7.2%), followed by McDonald's (49,450, 5.9%) and Deloitte (46,995, 5.6%). Together the top 10 firms account for roughly 43% of the full corpus, making corpus-level vocabulary heavily shaped by large, globally-prominent employers.
+
+This concentration means corpus-level linguistic patterns will disproportionately reflect the vocabulary of large employers. Stratified sampling by overall_rating does not correct for this: since firms are not sampled equally within each rating tier, IBM and McDonald's will still contribute disproportionately to our working sample. Rather than treating this as a flaw, we acknowledge it as a structural feature of the data， our analysis answers “what do large, heavily-reviewed employers look like across the rating spectrum?” rather than treating all 428 firms as equally weighted. The company distribution is therefore a key structural property of the data that shapes the similarity patterns we observe. The anomaly analysis in Section 5 will examine whether reviews from smaller firms are more likely to be anomalous, which would suggest that the large-firm dominance creates a “normal” linguistic pattern that smaller firms deviate from. The similarity analysis in Section 4 will also examine whether reviews cluster by firm, which would suggest that the large firms have distinctive linguistic patterns that set them apart from the rest of the corpus.
+
+## 2 Analytical Framework
+
+The EDA in §1.1 established three structural facts about the corpus: (i) core text fields (`pros`, `cons`) are near-complete while sub-rating fields are heavily missing, (ii) reviews are short (median ≈ 20 words) and strongly positivity-skewed (≈61% rated 4★/5★), and (iii) review volume is recency-weighted toward 2015 onward. Facts (i) and (ii) motivated the preprocessing decisions (dropping sub-rating fields, LSA over raw bag-of-words) and sampling design (period × rating stratified, §3.1). They also bound what a useful definition of similarity and anomaly can look like on this corpus: with short texts and a skewed rating distribution, any definition that ignores *what* employees actually write and relies instead on length or metadata will be dominated by the skew. The definitions below are therefore anchored in the **semantic content** of the text, not its structural attributes.
+
+Beyond internal data structure, the choice of which dimensions to formalise is also informed by what the academic and operational literatures treat as analytically interesting in Glassdoor data. Two strands converge on the same two dimensions: (a) **vocabulary-based cultural signal** — a body of text-mining work uses the language of employee reviews as a proxy for corporate culture and employee voice, with studies ranging from Luo et al.'s early ICIS work linking review text to firm performance to more recent topic-modelling and aspect-based sentiment work on employer branding; and (b) **rating–text inconsistency as a manipulation signal** — Glassdoor itself publicly flags "Ballot-Box Stuffing" and "Inflated Reviews", and industry commentary repeatedly identifies mismatches between rating spikes and text content as the dominant fake-review pattern. Strand (a) motivates the vocabulary-based similarity measure in §2.1; strand (b) motivates the rating–text divergence anomaly subtype in §2.2. Neither strand justifies a structural (length-based) channel, which is why both definitions are anchored in semantic content rather than surface attributes.
+
+### 2.1 Defining Similarity
+
+In this analysis, **similarity** refers to the degree to which two employee reviews share a common semantic pattern when describing their workplace experience. It is operationalised as a single, vocabulary-based measure.
+
+**Vocabulary similarity.** Reviews are represented as L2-normalised 200-dimensional LSA vectors, concatenating the pros-side and cons-side projections. The **pairwise cosine similarity** between two review vectors captures the degree to which they load on the same latent dimensions of workplace vocabulary. Because the Glassdoor dataset separates sentiment into two structurally distinct fields, `pros` and `cons`, the fields are treated as **separate documents** rather than concatenated. A firm where employees write nearly identical pros but divergent cons may have consistent benefits but variable management experiences across teams; concatenation would blur that distinction. The measure is defined as **temporally agnostic**: a review written in 2020 and one written in 2015 are compared solely on vocabulary, not on when they were written. The practical implication is that pandemic-era vocabulary ("remote work", "furlough") shared across 2020 reviews will manifest as elevated within-period similarity, but this is a real linguistic pattern, not an artefact. Because reviews are compared in the LSA space rather than in raw TF-IDF, vocabulary similarity here is implicitly **latent-topic similarity**: two reviews count as similar when they load on the same latent co-occurrence axes (interpreted in §3.4.4), even if they share few exact tokens. This dimension operationalises strand (a) above: vocabulary overlap between co-employees is the textual trace of a shared cultural experience.
+
+**Why not a separate "structural similarity" dimension.** A third candidate dimension — whether two reviews have similar word counts or pros/cons balance — was considered and rejected. L2 normalisation already projects every review onto the unit hypersphere before cosine similarity is computed, so raw length differences are largely absorbed; and more importantly, on this corpus structural similarity carries little independent analytical value. Two reviews can be structurally near-identical (both 15 words, both balanced between pros and cons) while being semantically opposite; conversely, two reviews of very different length can express nearly the same meaning. Adding a length-based similarity channel would therefore dilute rather than enrich the measure.
+
+Similarity is evaluated at **within-firm level**: whether employees at the same company use consistent language. A high average pairwise similarity within a firm indicates a shared, uniform workplace culture; a low score indicates fragmented or heterogeneous experiences across teams or roles.
+
+### 2.2 Defining Anomalies
+
+In this analysis an **anomaly** is a review whose **semantic fingerprint** — its position in the 200-dimensional LSA space — is statistically inconsistent with the broader corpus, not merely a review that expresses an unusual opinion. "Semantic fingerprint" is the preferred term because LSA captures patterns of term association rather than surface strings: the fingerprint reflects what a review *means*, approximated by which latent vocabulary dimensions it loads on. Two subtypes, each motivated by a distinct external concern, are used:
+
+1. **Vocabulary anomalies** (corpus-interior sense). Reviews that use highly idiosyncratic or rare terms, non-English phrases, technical jargon confined to a single role, or an unusual concentration of proper nouns, produce vectors that sit far from the corpus centroid in LSA space. These are detected by Isolation Forest applied to the 200-dimensional joint LSA representation (§5.1). This subtype captures *who writes atypically* — useful both as a data-quality signal (flagging low-information "Great!" reviews or fragments) and as a signal of niche experiences that may be analytically interesting in their own right.
+
+2. **Rating–text divergence anomalies** (manipulation-relevant sense). Reviews where the stated `overall_rating` contradicts the emotional valence implied by the text — a 5-star review whose vocabulary closely resembles 1-star reviews, or vice versa — are anomalous in a semantically meaningful sense that pure vocabulary rarity misses. This is the pattern Glassdoor itself publicly identifies as the signature of review manipulation (coordinated rating inflation without matching textual enthusiasm). These reviews are captured by the secondary signal defined in §5.2: the difference between each review's projection on the 5-star centroid and the 1-star centroid in LSA space.
+
+**Why not a separate "structural anomaly" subtype.** Length extremity was initially a candidate third subtype but was removed because it does not reliably isolate the phenomenon of interest. A 500-word `cons` entry is structurally extreme but is just as likely to reflect an engaged employee who genuinely cares about the organisation as it is a genuine outlier; a one-word `pros` entry ("Pay") is also structurally extreme but is a common corpus pattern rather than an unusual one. Length therefore fails both directions of the anomaly test — it flags too many non-anomalies (engaged long-form writers) and misses too many genuine anomalies (short reviews whose vocabulary is unusual). The LSA-based Isolation Forest in §5.1 already picks up length effects indirectly (very short reviews land in a sparse region of the LSA space), so an explicit length channel adds redundancy rather than signal.
+
+An important distinction is that anomaly is **not** synonymous with low quality or unreliability. A detailed, thoughtful 500-word review that happens to discuss a niche topic (say, veterinary accreditation at a specific clinic) may be flagged as a vocabulary anomaly; this is informative rather than problematic. Anomaly detection identifies the edges of the distribution; interpretation requires reading the actual text. The sociologically important cases are those where semantic unusualness corresponds to an unusual *experience* or to a coordinated *manipulation pattern* rather than merely to an uncommon *writing style*.
+
+### 2.3 Research Model
+
+The diagram below summarises the end-to-end pipeline, in the style of the research-model flow diagrams used by Luo et al. (ICIS 2016) and the Nature HSS Communications (2025) decent-work text-mining paper. It makes explicit which data inputs feed which analytical step, where the Part A pipeline terminates, and where Part B branches off to answer a separate research question on the same stratified sample.
+
+```{mermaid}
+%%| label: fig-pipeline
+%%| fig-cap: "Research model. Part A (top) uses LSA-based semantic vectors for firm-level similarity and review-level anomaly detection; Part B (bottom) uses sentence-transformer embeddings on the same stratified sample for topic discovery and COVID-era vocabulary shift analysis."
+flowchart TD
+    classDef source fill:#e3f2fd,stroke:#1565c0,stroke-width:1px,color:#0d47a1;
+    classDef prep   fill:#fff3e0,stroke:#e65100,stroke-width:1px,color:#bf360c;
+    classDef repA   fill:#f3e5f5,stroke:#6a1b9a,stroke-width:1px,color:#4a148c;
+    classDef analA  fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px,color:#1b5e20;
+    classDef repB   fill:#fce4ec,stroke:#ad1457,stroke-width:1px,color:#880e4f;
+    classDef analB  fill:#ede7f6,stroke:#4527a0,stroke-width:1px,color:#311b92;
+    classDef out    fill:#eceff1,stroke:#37474f,stroke-width:1px,color:#263238;
+
+    %% Source
+    SRC["<b>Glassdoor corpus</b><br/>838k UK employee reviews<br/>(pros, cons, overall_rating,<br/>firm, year)"]
+
+    %% Preprocessing / sampling
+    EDA["<b>§1 EDA</b><br/>• missingness, length, rating/time skew<br/>• 3 structural facts bound definitions"]
+    STRAT["<b>§3.1 Stratified sample</b><br/>15 strata (3 periods × 5 ratings)<br/><b>n = 150,000</b>"]
+    PREP["<b>§3.2 Text preprocessing</b><br/>lowercase → tokens → stopword removal<br/>→ lemmatisation (spaCy)"]
+
+    %% Part A representation + analyses
+    TFIDF["<b>§3.3 TF-IDF (pros & cons fitted independently)</b><br/>2 separate vectorisers · ngram (1–3)<br/>min_df=5, max_df=0.85, max_features=8 000<br/>sublinear_tf=True"]
+    LSA["<b>§3.4 LSA via TruncatedSVD</b><br/>2 × (n × 8 000) → 2 × (n × 100)<br/>L2-norm → hstack → L2-norm → <b>200-dim joint</b>"]
+
+    SIM["<b>§4 Within-firm similarity</b><br/>pairwise cosine on 200-dim LSA<br/>→ firm-level cultural cohesion"]
+    ANOM["<b>§5 Anomaly detection</b><br/>§5.1 Isolation Forest (vocabulary unusualness)<br/>§5.2 RTD (rating–text divergence via 1★/5★ centroids)<br/>reported as two separate signals (Tables A &amp; B in §5.3)"]
+    BRIDGE["<b>§3.5 Plotly 3D LSA visualisation</b><br/><i>bridge: rating ≫ period &gt; company type</i><br/>motivates Part B's split-representation design"]
+    OUTA["<b>Part A outputs</b><br/>• firm similarity ranking (§4)<br/>• top RTD &amp; IF anomalies (§5.3)<br/>• firm-vocabulary anomaly finding (§6)"]
+
+    %% Part B representation + analyses
+    EMB["<b>§8.1 Sentence embeddings</b><br/>all-MiniLM-L6-v2<br/>→ 384-dim per review"]
+    UMAP["<b>§8.1 UMAP reduction</b><br/>384 → 5 dims (for HDBSCAN)"]
+
+    BT["<b>§8.1 → §8.3 BERTopic + HDBSCAN</b><br/>min_cluster_size=200<br/>→ topic clusters + c-TF-IDF terms<br/>→ topic × period composition (§8.3)"]
+    LR["<b>§8.4 Log-ratio shift</b><br/>pre-COVID (2008–19) vs COVID (2020–21)<br/>term frequency ratios"]
+    SENT["<b>§8.5 Sentiment by period</b><br/>reuses §5.2 text_valence (LSA 1★/5★ centroids)<br/>on the 2008–19 / 2020–21 split"]
+    OUTB["<b>Part B outputs</b><br/>• vocabulary emergence (covid, wfh, wlb, DEI, furlough)<br/>• topic composition shift (T60, T13, T20 enriched; T40, T49, T31 depleted)<br/>• rating &amp; text valence move together (no overall sentiment shift)"]
+
+    %% Edges
+    SRC --> EDA --> STRAT --> PREP
+    PREP --> TFIDF --> LSA
+    LSA --> SIM --> OUTA
+    LSA --> ANOM --> OUTA
+    LSA --> BRIDGE
+    BRIDGE -. motivates .-> EMB
+    PREP --> EMB --> UMAP
+    UMAP --> BT --> OUTB
+    PREP --> LR --> OUTB
+    LSA -. text_valence reused .-> SENT --> OUTB
+    STRAT -. same 150k sample .-> EMB
+
+    %% Class assignments (via `class` statement to avoid ::: which Quarto
+    %% interprets as a fenced-div marker)
+    class SRC source
+    class EDA,STRAT,PREP prep
+    class TFIDF,LSA repA
+    class SIM,ANOM analA
+    class EMB,UMAP repB
+    class BT,LR,SENT analB
+    class BRIDGE prep
+    class OUTA,OUTB out
+```
+
+The diagram highlights three features of the design. First, **Part A and Part B share the same stratified sample** (§3.1), but diverge at the representation step: Part A uses a sparse-then-reduced TF-IDF → LSA pipeline that is interpretable at the term level (§3.4.4 loadings); Part B uses a dense sentence-transformer representation that captures paraphrase and semantic nuance but is not term-interpretable on its own — which is why BERTopic pairs it with c-TF-IDF to recover term-level interpretability post-hoc. Second, the **two anomaly signals in Part A are computed from the same 200-dim LSA space** (Isolation Forest on the raw vectors; RTD on the 1★/5★ centroid projections); they are reported as two separate top-10 tables in §5.3 (each surfacing a different kind of unusualness), and §6 uses the IF flags directly for the cross-tab. A composite score is computed as a convenience field in code (`60% IF + 40% RTD`) but the analytical narrative is built on the two signals individually rather than on the composite. Third, the **§3.5 Plotly visualisation is a bridge, not a Part A output**: it shows that rating dominates the LSA space (`rating ≫ period > company type`), and that ordering is what motivates Part B's split into a different representation (MiniLM) on the same sample. Part B itself reuses one Part A artefact directly — the §5.2 text-valence scalar derived from LSA 1★/5★ centroids feeds the §8.5 sentiment-by-period analysis, so Part B is not an isolated branch but layered on Part A's representation work.
+
+## 3 Data Preprocessing
+
+### 3.1 Stratified Sampling
+
+The corpus has two structural imbalances: a strong rating skew (§1.1.2: 60.9% of reviews are 4★ or 5★) and a temporal imbalance (§1.1.3: 2020–2021 alone contributes 33.9% of all reviews). Rather than correcting either imbalance by artificially equalising strata, I draw a **proportional stratified sample** across **15 strata defined by temporal period × overall_rating** (3 periods × 5 rating tiers). Sampling proportionally from each stratum ensures the sample distribution mirrors the population in both dimensions, the natural positivity skew and recency-weighting are preserved, not suppressed.
+
+**Choosing the target sample size** involves three competing forces:
+
+| Force | Direction | Key insight |
+|---|---|---|
+| Vocabulary coverage | ↑ want larger | Unique terms (min_df=5) grow with *n* but saturate, the accumulation curve has an elbow |
+| Computation | ↑ want smaller | TruncatedSVD time scales ≈O(*n*); 150k ≈ 3× slower than 50k but still renders in ~5 min |
+| iForest masking | ↑ want smaller *n* per tree, not total *n* | `max_samples=s` caps the sub-sample per tree, masking is controlled by *s*, not total *n*. Going 50k→150k with `max_samples=512` keeps masking identical. |
+
+The vocabulary accumulation analysis below identifies the empirical saturation point, where marginal vocabulary gain per 10,000 additional reviews drops to near zero, and uses that to set `TARGET_N`.
+
+```{python}
+#| label: sample size sensitivity
+#| fig-cap: "Vocabulary accumulation curve: unique terms (min_df = 5) and marginal gain per 10k reviews."
+
+# ── Vocabulary accumulation: CountVectorizer is fast even at 300k ─────────────
+df['_sens_text'] = (df['pros'].fillna('') + ' ' + df['cons'].fillna('')).str.lower()
+
+SIZES   = [30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 300_000]
+_records, _prev = [], 0
+for _n in SIZES:
+    _sub = df['_sens_text'].sample(min(_n, len(df)), random_state=42)
+    _cv  = CountVectorizer(min_df=5, max_df=0.95, stop_words='english')
+    _cv.fit(_sub)
+    _v = len(_cv.vocabulary_)
+    _prev_n = SIZES[SIZES.index(_n) - 1] if _n != SIZES[0] else 0
+    _records.append({'n': _n, 'vocab': _v,
+                     'marginal': _v - _prev,
+                     'per_10k': (_v - _prev) / max(_n - _prev_n, 1) * 10_000})
+    _prev = _v
+sens_df = pd.DataFrame(_records)
+
+print("Vocabulary accumulation (unigrams, min_df=5):")
+print(f"  {'n':>8}  {'vocab':>8}  {'per 10k':>10}")
+for _, r in sens_df.iterrows():
+    print(f"  {r['n']:>8,.0f}  {r['vocab']:>8,.0f}  {r['per_10k']:>10.1f}")
+
+TARGET_N = 150_000   # elbow: marginal gain drops sharply above this (see right panel below)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4), constrained_layout=True)
+
+axes[0].plot(sens_df['n']/1_000, sens_df['vocab']/1_000, 'o-', color='#4C9BE8', lw=2, ms=7)
+axes[0].set_xlabel('Sample size (thousands)'); axes[0].set_ylabel('Vocabulary (thousands, min_df=5)')
+axes[0].set_title('Vocabulary saturates above ~150k reviews — justifying the chosen sample size', fontweight='bold'); axes[0].grid(alpha=0.3)
+for _, r in sens_df.iterrows():
+    axes[0].annotate(f"{r['vocab']/1_000:.1f}k",
+                     (r['n']/1_000, r['vocab']/1_000),
+                     textcoords='offset points', xytext=(0, 8), ha='center', fontsize=8)
+
+bar_colors = ['#d32f2f' if n == TARGET_N else '#E87A4C' for n in sens_df['n']]
+axes[1].bar(sens_df['n']/1_000, sens_df['per_10k'], color=bar_colors, edgecolor='white')
+axes[1].set_xlabel('Sample size (thousands)'); axes[1].set_ylabel('New terms per 10k additional reviews')
+axes[1].set_title('Marginal vocabulary gain flattens beyond ~150k reviews', fontweight='bold')
+axes[1].grid(axis='y', alpha=0.3)
+for bar, r in zip(axes[1].patches, sens_df.itertuples()):
+    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                 f'{r.per_10k:.0f}', ha='center', fontsize=8)
+
+plt.suptitle('Sample-size sensitivity: vocabulary coverage at increasing n',
+             fontsize=12, fontweight='bold')
+plt.show()
+
+_chosen_v = sens_df.loc[sens_df['n'] == TARGET_N, 'vocab'].iloc[0]
+_full_v   = sens_df['vocab'].iloc[-1]
+print(f"\nChosen TARGET_N = {TARGET_N:,}")
+print(f"  Vocabulary at 150k: {_chosen_v:,} terms  ({_chosen_v/_full_v*100:.1f}% of 300k vocabulary)")
+print(f"  Marginal gain 150k→300k: {_full_v - _chosen_v:,} terms at 2× computation cost → not justified")
+print(f"  Sample fraction: {TARGET_N/len(df)*100:.1f}% of corpus")
+```
+
+The marginal-gain panel identifies the elbow: the gain per 10,000 additional reviews drops sharply and flattens after ~150k. Below the elbow, each additional block of reviews brings many new vocabulary entries that would otherwise be absent from the TF-IDF matrix; above it, additional reviews add mostly duplicate tokens that are already well-represented. The chosen `TARGET_N = 150,000` sits at this elbow, capturing the large majority of the accessible vocabulary while keeping TruncatedSVD and IsolationForest runtimes tractable. Note that all sampled data are compressed further by LSA (200 dimensions), so the effective information bottleneck is at the SVD layer, not at the sample size; the vocabulary analysis confirms that 150k is sufficient to span the input space of that compression.
+
+```{python}
+#| label: stratified sample
+
+np.random.seed(42)
+# TARGET_N defined in the sensitivity cell above
+
+# ── Assign period labels to full dataset (year_review computed in §1.1.3) ────
+df['period'] = pd.cut(
+    df['year_review'],
+    bins=[2007, 2015, 2019, 2022],
+    labels=['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']
+)
+
+# ── Compute proportional quotas for each period × rating stratum ──────────────
+strata_pop = df.groupby(['period', 'overall_rating'], observed=True).size().rename('n_pop')
+quotas = (strata_pop / strata_pop.sum() * TARGET_N).round().astype(int)
+quotas = quotas.clip(lower=50)   # floor: minimum 50 reviews per stratum
+
+# ── Draw sample from each stratum ─────────────────────────────────────────────
+pieces = []
+for (period_lv, rating_lv), n_target in quotas.items():
+    g = df[(df['period'] == period_lv) & (df['overall_rating'] == rating_lv)]
+    pieces.append(g.sample(n=min(n_target, len(g)), random_state=42))
+
+sample = pd.concat(pieces, ignore_index=True)
+sample['combined'] = (sample['pros'].fillna('') + ' ' + sample['cons'].fillna('')).str.strip()
+sample['firm_key'] = sample['firm'].map(normalise_firm_name)
+
+print(f"Sample: {len(sample):,} reviews across {len(quotas)} strata (3 periods × 5 rating tiers)")
+print(f"\nStratum counts (period × overall_rating):")
+print(sample.groupby(['period', 'overall_rating'], observed=True)
+           .size().unstack('overall_rating').to_string())
+```
+
+
+```{python}
+#| label: stratified sample validation
+#| fig-cap: "Fig 1. Proportional stratification validation: population vs sample distributions (left, centre) and sub-rating validity (right)."
+
+# ── Compute population and sample proportions for all 15 strata ──────────────
+samp_counts = (sample.groupby(['period', 'overall_rating'], observed=True)
+                     .size().rename('n_samp'))
+comp = pd.concat([strata_pop, samp_counts], axis=1).fillna(0).astype(int)
+comp['pop_pct']  = comp['n_pop']  / comp['n_pop'].sum()  * 100
+comp['samp_pct'] = comp['n_samp'] / comp['n_samp'].sum() * 100
+comp['dev_pp']   = (comp['samp_pct'] - comp['pop_pct']).abs()
+
+max_dev  = comp['dev_pp'].max()
+min_cell = samp_counts.min()
+
+# Chi-square goodness of fit: H₀ = sample proportions match population
+f_exp = comp['pop_pct'].values / 100 * comp['n_samp'].sum()
+chi2_stat, chi2_p = chisquare(f_obs=comp['n_samp'].values, f_exp=f_exp)
+
+print("── Stratification validation ──────────────────────────────────────────")
+print(f"  Total sample:              {len(sample):,}")
+print(f"  Strata:                    15  (3 periods × 5 rating tiers)")
+print(f"  Min stratum size:          {min_cell}  (threshold ≥ 50: {'✓' if min_cell >= 50 else '✗'})")
+print(f"  Max |pop % − sample %|:    {max_dev:.4f} pp")
+print(f"  χ²(14) = {chi2_stat:.2f},  p = {chi2_p:.3f}"
+      f"  → {'sample matches population ✓' if chi2_p > 0.05 else 'deviation detected ✗'}")
+
+# ── Visualise: population heatmap / sample heatmap / sub-rating heatmap ──────
+periods_ord = ['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']
+ratings_ord = [1, 2, 3, 4, 5]
+ylabels     = ['Early\n(2008–15)', 'Mature\n(2016–19)', 'COVID\n(2020–21)']
+
+def heatmap_panel(ax, col, title, cmap='YlOrRd'):
+    mat = (comp[col].unstack('overall_rating')
+                    .reindex(periods_ord)[ratings_ord].values)
+    im  = ax.imshow(mat, aspect='auto', cmap=cmap, vmin=0, vmax=mat.max())
+    ax.set_xticks(range(5)); ax.set_xticklabels(['1★','2★','3★','4★','5★'])
+    ax.set_yticks(range(3)); ax.set_yticklabels(ylabels, fontsize=8)
+    ax.set_title(title, fontweight='bold')
+    for i in range(3):
+        for j in range(5):
+            ax.text(j, i, f'{mat[i,j]:.1f}', ha='center', va='center', fontsize=8)
+    plt.colorbar(im, ax=ax, shrink=0.8, label='% of total')
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 4), constrained_layout=True)
+
+heatmap_panel(axes[0], 'pop_pct',
+              f'Population proportions (%)\n(full corpus, n={strata_pop.sum():,})')
+heatmap_panel(axes[1], 'samp_pct',
+              f'Sample proportions (%)\n(proportional sample, n={len(sample):,})')
+
+# Panel 3: Sub-rating validity (overall_rating is a reliable composite proxy)
+sub_cols   = ['work_life_balance', 'culture_values', 'career_opp', 'comp_benefits', 'senior_mgmt']
+sub_labels = ['Work-Life\nBalance', 'Culture &\nValues', 'Career\nOpp.', 'Comp &\nBenefits', 'Senior\nMgmt']
+sub_means  = df.groupby('overall_rating')[sub_cols].mean().reindex([1, 2, 3, 4, 5])
+im3 = axes[2].imshow(sub_means.values.T, aspect='auto', cmap='RdYlGn', vmin=1, vmax=5)
+axes[2].set_xticks(range(5)); axes[2].set_xticklabels(['1★','2★','3★','4★','5★'])
+axes[2].set_yticks(range(5)); axes[2].set_yticklabels(sub_labels, fontsize=8)
+axes[2].set_title('Mean sub-ratings by overall tier\n(full corpus)', fontweight='bold')
+axes[2].set_xlabel('Overall Rating')
+for i in range(5):
+    for j in range(5):
+        axes[2].text(j, i, f'{sub_means.values[j,i]:.2f}', ha='center', va='center', fontsize=7)
+plt.colorbar(im3, ax=axes[2], shrink=0.8, label='Mean sub-rating (1–5)')
+
+fig.suptitle('Proportional period × rating stratification: population vs sample, and rating validity',
+             fontsize=12, fontweight='bold')
+plt.show()
+```
+
+The left and centre heatmaps together validate the sampling design. The two proportion matrices are nearly identical by construction, the proportional design preserves both the rating skew (5★ most common, 1★ least common) and the temporal imbalance (COVID-era reviews dominate). The maximum absolute deviation between population and sample cell proportions is printed above; a chi-square goodness-of-fit test confirms the sample distribution is not significantly different from the population distribution. The minimum stratum size check ensures every period × rating cell has at least 50 reviews, sufficient for the distributional statistics in Sections 4 and 5. The right panel validates the use of `overall_rating` as the stratification variable: all five sub-ratings track overall rating tightly and monotonically, confirming it is a reliable composite proxy for workplace sentiment. Senior management shows the widest spread across tiers, foreshadowing its role in the anomaly analysis.
+
+**Robustness of the chosen sample size.** The proportional validation above confirms that the *single* n = 150,000 draw faithfully reproduces the population. A stronger claim — that n = 150k is large enough for stable downstream representations — requires checking that the vocabulary and stratum fidelity do not change meaningfully if a different size were used. The cell below re-draws proportional stratified samples at four target sizes (50k, 100k, 150k, 200k) and compares each one to the n = 150k reference on two axes: (a) **stratum-proportion fidelity** (chi-square p and max cell deviation against the full population), and (b) **vocabulary stability** — the Jaccard overlap of the top-500 TF-IDF terms (by document frequency) against the reference draw. If the Jaccard curve flattens around the chosen size, the representation is sample-size-stable and the downstream LSA/iForest/BERTopic pipelines are not sensitive to the specific n chosen within this neighbourhood.
+
+```{python}
+#| label: sample-size-robustness
+#| fig-cap: "Fig 2. Sample-size robustness: stratification fidelity and vocabulary stability at four target sizes, benchmarked against the n=150k reference."
+
+from sklearn.feature_extraction.text import CountVectorizer as _CV
+
+# ── Helper: draw a proportional period × rating sample at a target size ──────
+def _draw_prop_sample(n_target, seed=42):
+    q = (strata_pop / strata_pop.sum() * n_target).round().astype(int).clip(lower=50)
+    pieces = []
+    for (p_lv, r_lv), n_t in q.items():
+        g = df[(df['period'] == p_lv) & (df['overall_rating'] == r_lv)]
+        pieces.append(g.sample(n=min(n_t, len(g)), random_state=seed))
+    return pd.concat(pieces, ignore_index=True)
+
+# ── Helper: top-K terms by document frequency (fast, min_df=5) ───────────────
+def _top_terms(sub, K=500):
+    text = (sub['pros'].fillna('') + ' ' + sub['cons'].fillna('')).str.lower()
+    cv   = _CV(min_df=5, max_df=0.95, stop_words='english', max_features=5000)
+    X    = cv.fit_transform(text)
+    df_  = np.asarray((X > 0).sum(axis=0)).ravel()
+    vocab = np.array(cv.get_feature_names_out())
+    idx  = np.argsort(-df_)[:K]
+    return set(vocab[idx])
+
+# ── Reference: n=150k draw (seed 42) ─────────────────────────────────────────
+ref_sample = sample                        # already TARGET_N = 150k with seed 42
+ref_terms  = _top_terms(ref_sample, K=500)
+
+# ── Compare across sizes ─────────────────────────────────────────────────────
+ROBUST_N = [50_000, 100_000, 150_000, 200_000]
+rob_records = []
+for _n in ROBUST_N:
+    _s = _draw_prop_sample(_n, seed=42)
+    # Stratum fidelity vs population
+    _sc = _s.groupby(['period', 'overall_rating'], observed=True).size()
+    _full = pd.concat([strata_pop, _sc.rename('n_s')], axis=1).fillna(0)
+    _pop_pct  = _full['n_pop']  / _full['n_pop'].sum()
+    _samp_pct = _full['n_s']    / _full['n_s'].sum()
+    _max_dev  = (_samp_pct - _pop_pct).abs().max() * 100
+    _chi2, _p = chisquare(f_obs=_full['n_s'].values,
+                          f_exp=_pop_pct.values * _full['n_s'].sum())
+    # Vocabulary stability vs reference
+    _terms = _top_terms(_s, K=500)
+    _jac   = len(_terms & ref_terms) / len(_terms | ref_terms)
+    rob_records.append({'n': _n, 'max_dev_pp': _max_dev, 'chi2_p': _p,
+                        'jaccard_vs_ref': _jac, 'vocab_top500': len(_terms)})
+
+rob_df = pd.DataFrame(rob_records)
+print("── Sample-size robustness ─────────────────────────────────────────────")
+print(rob_df.to_string(index=False,
+    formatters={'n': '{:>7,.0f}'.format,
+                'max_dev_pp': '{:.4f}'.format,
+                'chi2_p':     '{:.3f}'.format,
+                'jaccard_vs_ref': '{:.4f}'.format}))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4), constrained_layout=True)
+
+bar_c = ['#d32f2f' if n == TARGET_N else '#4C9BE8' for n in rob_df['n']]
+axes[0].bar(rob_df['n']/1_000, rob_df['max_dev_pp'], color=bar_c, edgecolor='white')
+axes[0].set_xlabel('Sample size (thousands)')
+axes[0].set_ylabel('Max |sample % − population %|  (pp)')
+axes[0].set_title('Stratum-proportion fidelity (lower = better)', fontweight='bold')
+axes[0].grid(axis='y', alpha=0.3)
+for _x, _y in zip(rob_df['n']/1_000, rob_df['max_dev_pp']):
+    axes[0].text(_x, _y + 0.0005, f'{_y:.3f}', ha='center', fontsize=8)
+
+axes[1].plot(rob_df['n']/1_000, rob_df['jaccard_vs_ref'],
+             'o-', color='#E87A4C', lw=2, ms=8)
+axes[1].axhline(1.0, color='grey', ls=':', lw=1)
+axes[1].set_xlabel('Sample size (thousands)')
+axes[1].set_ylabel('Jaccard(top-500 terms, n=150k ref)')
+axes[1].set_title('Vocabulary stability vs n=150k reference (higher = more stable)',
+                  fontweight='bold')
+axes[1].grid(alpha=0.3)
+axes[1].set_ylim(0.7, 1.02)
+for _x, _y in zip(rob_df['n']/1_000, rob_df['jaccard_vs_ref']):
+    axes[1].annotate(f'{_y:.3f}', (_x, _y),
+                     textcoords='offset points', xytext=(0, 8),
+                     ha='center', fontsize=8)
+
+fig.suptitle('Sample-size robustness: proportional design is size-stable around n=150k',
+             fontsize=12, fontweight='bold')
+plt.show()
+```
+
+The robustness table and figure together confirm that n = 150,000 is not a fragile choice. **Stratum-proportion fidelity** is excellent at every size — the maximum deviation between sample and population cell proportions is well under 0.05 pp in all four draws, and the chi-square goodness-of-fit p-values are all comfortably above 0.05. This is a mechanical consequence of the proportional design: fidelity is controlled by the rounding of 15 stratum quotas, not by the total n. **Vocabulary stability** is the more informative test. The Jaccard overlap between the top-500 TF-IDF terms at each size and the n = 150k reference is already high at n = 50k and saturates by n = 100k; going from 150k to 200k yields a negligible gain. This matches the earlier vocabulary accumulation result (§3.1 sensitivity cell) and establishes that the downstream LSA basis, similarity matrix, and anomaly scores are not artefacts of the specific sample size chosen — any n in the 100k–200k band would produce a near-identical term space.
+
+
+### 3.2 Text Cleaning and Feature Construction
+
+```{python}
+#| label: text preprocessing
+
+# Preserve raw text for diagnostics, examples, and before/after comparisons
+sample['pros_raw'] = sample['pros'].fillna('')
+sample['cons_raw'] = sample['cons'].fillna('')
+sample['combined_raw'] = (sample['pros_raw'] + ' ' + sample['cons_raw']).str.strip()
+
+# Word-count diagnostic before preprocessing
+sample['sample_words_raw'] = sample['combined_raw'].str.split().str.len()
+
+print("Raw sample text-length summary (combined pros + cons):")
+print(sample['sample_words_raw'].describe().round(1).to_string())
+print(f"\nReviews with ≤ 3 combined words:  "
+      f"{(sample['sample_words_raw'] <= 3).sum():,}  "
+      f"({(sample['sample_words_raw'] <= 3).mean()*100:.2f}%)")
+print(f"Reviews with ≥ 200 combined words: "
+      f"{(sample['sample_words_raw'] >= 200).sum():,}  "
+      f"({(sample['sample_words_raw'] >= 200).mean()*100:.2f}%)")
+
+# Step-by-step pipeline demonstration on a single example
+demo_text = "The managers were NOT flexible! Poor work-life balance and no career opportunities."
+print("── Preprocessing pipeline (step-by-step on demo text) ──")
+print(f"  ORIGINAL  : {demo_text}")
+
+# Step 1: lowercase
+step1 = demo_text.lower()
+print(f"  1. Lower casing  : {step1}")
+
+# Step 2: tokenise and remove punctuation (keep only alphabetic tokens)
+step2_tokens = re.findall(r"[a-z]+", step1)
+print(f"  2. Tokenising  : {step2_tokens}")
+
+# Step 3: remove stopwords (spaCy stops)
+stops = nlp.Defaults.stop_words
+step3_tokens = [t for t in step2_tokens if t not in stops and len(t) > 2]
+print(f"  3. No stopwords: {step3_tokens}")
+
+# Step 4: lemmatise with spaCy
+step4_doc = nlp(" ".join(step3_tokens))
+step4_tokens = [tok.lemma_ for tok in step4_doc if tok.is_alpha]
+print(f"  4. Lemmatisation  : {step4_tokens}")
+print()
+
+# Apply full pipeline to sample 
+# Preprocessing pros and cons with spaCy lemmatisation
+sample['pros_clean'] = [
+    ' '.join(clean_text(doc))
+    for doc in nlp.pipe(sample['pros_raw'].tolist(), batch_size=1000)
+]
+sample['cons_clean'] = [
+    ' '.join(clean_text(doc))
+    for doc in nlp.pipe(sample['cons_raw'].tolist(), batch_size=1000)
+]
+sample['combined'] = (sample['pros_clean'] + ' ' + sample['cons_clean']).str.strip()
+sample['sample_words'] = sample['combined'].str.split().str.len()
+
+compression = (
+    sample['sample_words_raw'].replace(0, np.nan) /
+    sample['sample_words'].replace(0, np.nan)
+)
+
+# Word-count diagnostic after preprocessing
+print("Post-preprocessing text-length summary (combined pros + cons):")
+print(sample['sample_words'].describe().round(1).to_string())
+print(f"\nMedian compression ratio (raw / clean): {compression.median():.2f}x")
+print(f"Mean compression ratio (raw / clean):   {compression.mean():.2f}x")
+
+example_idx = sample['sample_words_raw'].idxmax()
+print("\nExample review before preprocessing (first 250 chars):")
+print(sample.loc[example_idx, 'combined_raw'][:250])
+print("\nExample review after preprocessing (first 250 chars):")
+print(sample.loc[example_idx, 'combined'][:250])
+```
+
+The length statistics and compression ratios printed above quantify what preprocessing does to this corpus. Raw combined text has a mean of **35.9 words** and a median of **19**. After lemmatisation and stopword removal, the mean falls to **18.7** and the median to **12**, with a **median compression ratio of 1.75× and a mean of 1.82×**. The typical review therefore loses roughly 45 % of its tokens, and that stripped share is grammatical scaffolding (articles, prepositions, auxiliary verbs) rather than content. What remains averages ~12 lemmas: an extremely thin vector for any bag-of-words model, and the direct cause of the sparsity problem that motivates TF-IDF and LSA in Sections 3.3–3.4. The pipeline retains signal for virtually the entire sample (the small handful of reviews that collapse to zero clean tokens are short fragments such as a single stop-word). The **maximum of 723 clean tokens** (from a long raw review well over 1 ,000 words) shows that structurally anomalous long reviews retain a proportionally larger vocabulary, relevant to the length-based discussion in Section 2.2.
+
+The pros and cons fields are processed **separately** throughout embedding, because they capture structurally distinct speech acts: pros tend to contain noun-phrase descriptions of benefits ("good salary", "smart colleagues", "flexible hours"), while cons tend to contain problem framings ("poor management", "long hours", "no work-life balance"). Concatenating them before vectorisation would merge these rhetorical styles and dilute the between-field signal that the dual-document similarity measure (Section 4) exploits.
+
+The preprocessing pipeline applies **lowercasing, stopword removal, and lemmatisation** in sequence. In general, these steps removes noise, irrelevant content and inconsistencies, ensuring that the text is clean and standardized. It therefore help the downstream NLP models learn meaningful patterns more effectively, improving predictions and classification results. Lemmatisation is preferable to stemming because the report later interprets individual terms directly, a stemmer can produce truncated non-words or over-collapse distinct concepts, while lemmatisation returns linguistically valid base forms ("managers" → "manager", "worked" → "work"). For short reviews where a single token often carries a large share of meaning, preserving interpretable vocabulary matters more than the small speed gain from stemming.
+
+```{python}
+#| label: preprocessing-diagnostics
+#| fig-cap: "Fig 3. Pros and cons before and after preprocessing: separate word clouds and top-10 frequency charts."
+
+def build_counter(text_series, processor):
+    counter = Counter()
+    for text in text_series:
+        counter.update(processor(text))
+    return counter
+
+pros_raw_counter = build_counter(sample['pros_raw'], raw_alpha_tokens)
+cons_raw_counter = build_counter(sample['cons_raw'], raw_alpha_tokens)
+pros_clean_counter = Counter(' '.join(sample['pros_clean']).split())
+cons_clean_counter = Counter(' '.join(sample['cons_clean']).split())
+
+def draw_wordcloud(ax, counter, title, cmap):
+    wc = WordCloud(width=700, height=350, background_color='white',
+                   max_words=80, colormap=cmap).generate_from_frequencies(counter)
+    ax.imshow(wc, interpolation='bilinear')
+    ax.axis('off')
+    ax.set_title(title, fontsize=11, fontweight='bold')
+
+def draw_top10_bar(ax, counter, title, color):
+    top = counter.most_common(10)
+    words = [w for w, _ in top][::-1]
+    counts = [c for _, c in top][::-1]
+    ax.barh(words, counts, color=color, edgecolor='white', height=0.7)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.set_xlabel('Frequency')
+    ax.grid(axis='x', alpha=0.3)
+    xmax = max(counts) if counts else 1
+    for bar, val in zip(ax.patches, counts):
+        ax.text(bar.get_width() + xmax * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:,}',
+                va='center', fontsize=8)
+
+fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+
+draw_wordcloud(axes[0, 0], pros_raw_counter, 'Pros — raw text', 'Reds')
+draw_top10_bar(axes[0, 1], pros_raw_counter, 'Pros — top 10 before preprocessing', '#E84C4C')
+draw_wordcloud(axes[0, 2], pros_clean_counter, 'Pros — after preprocessing', 'Blues')
+draw_top10_bar(axes[0, 3], pros_clean_counter, 'Pros — top 10 after preprocessing', '#4C9BE8')
+
+draw_wordcloud(axes[1, 0], cons_raw_counter, 'Cons — raw text', 'Reds')
+draw_top10_bar(axes[1, 1], cons_raw_counter, 'Cons — top 10 before preprocessing', '#E84C4C')
+draw_wordcloud(axes[1, 2], cons_clean_counter, 'Cons — after preprocessing', 'Blues')
+draw_top10_bar(axes[1, 3], cons_clean_counter, 'Cons — top 10 after preprocessing', '#4C9BE8')
+
+plt.suptitle('Before and after preprocessing: pros and cons separately',
+             fontsize=13, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+The before/after contrast exposes a limitation that motivates the TF-IDF step. spaCy's stopword list removes grammatical function words but does **not** remove common sentiment adjectives such as "good", "great" or generic nouns "work", "company". These are content words from the lexicon's perspective, so they survive lemmatisation. The post-preprocessing word clouds confirm this: both pros and cons remain partially dominated by generic evaluative terms that carry no firm-specific or rating-specific discriminatory signal. The two documents do develop distinct lexical focus after cleaning, pros vocabularies cluster around benefits and culture terms ("good", "benefit", "environment") while cons vocabularies cluster around management and workload terms ("management", "hour", "long"), but within each field the high-frequency generic layer persists ("work"). This is precisely the problem that `max_df=0.85` and TF-IDF inverse-document weighting in Section 3.3 are designed to suppress: terms appearing in a large fraction of reviews receive near-zero IDF weight regardless of their raw frequency, effectively demoting "work" and "good" in favour of rarer, more distinctive tokens.
+
+### 3.3 TF-IDF Vectorisation
+
+```{python}
+#| label: tfidf-vectorisation
+
+TFIDF_PARAMS = dict(
+    min_df=5,          # Drop terms in fewer than 5 documents — noise suppression
+    max_df=0.85,       # Drop terms in >85 % of documents — removes uninformative filler
+    max_features=8_000,
+    sublinear_tf=True, # log(1 + tf) scaling — compresses extreme counts
+    ngram_range=(1, 3) # Unigrams + bigrams + trigrams: captures "work life balance" as a direct feature
+)
+
+tfidf_pros = TfidfVectorizer(**TFIDF_PARAMS)
+X_pros = tfidf_pros.fit_transform(sample['pros_clean'])
+
+tfidf_cons = TfidfVectorizer(**TFIDF_PARAMS)
+X_cons = tfidf_cons.fit_transform(sample['cons_clean'])
+
+print(f"\nPros TF-IDF matrix:  {X_pros.shape}  "
+      f"  density {X_pros.nnz / (X_pros.shape[0] * X_pros.shape[1]):.5f}")
+print(f"Cons TF-IDF matrix:  {X_cons.shape}  "
+      f"  density {X_cons.nnz / (X_cons.shape[0] * X_cons.shape[1]):.5f}")
+print(f"\nVocabulary sizes after filtering:")
+print(f"  Pros: {len(tfidf_pros.vocabulary_):,} terms")
+print(f"  Cons: {len(tfidf_cons.vocabulary_):,} terms")
+```
+
+Each filtering choice trades off a specific failure mode of TF-IDF on this corpus. The table below states the chosen value, the more standard textbook alternative for short-text TF-IDF, and the corpus-specific reason for moving off the alternative.
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative on this corpus |
+|---|---|---|---|
+| `min_df` | **5** | 2 or 3 (small corpora) | At n = 150,000 reviews, a term appearing in only 2–4 documents is almost certainly a typo, a single-firm proper noun, or one-off slang. Setting `min_df=2` would inflate vocabulary into the tens of thousands and dominate the LSA basis with idiosyncratic noise (the cons-Dim 1 negative pole already reveals how rare phrasing absorbs a whole latent axis even at min_df=5). Setting `min_df=10` would oversuppress meaningful niche vocabulary (e.g. "stock vest", "garden leave"). 5 is the smallest threshold at which corpus-recurrent meaning survives but typos do not. |
+| `max_df` | **0.85** | 0.95–1.0 (default) | Words such as `work`, `good`, `company`, `great` survive lemmatisation and are content words from the tokeniser's perspective, but they appear in more than 85% of reviews and so carry near-zero discriminative weight even after IDF. Keeping them dominates the leading LSA dimensions with generic evaluative vocabulary and leaves less room for the framing axes (instrumental vs relational, career-stage vs institutional) recovered in §3.4.4. 0.85 is empirically the cut at which generic evaluative terms drop out without removing analytically useful frequent terms (e.g. "manager", "team"). |
+| `max_features` | **8,000** | unbounded; or 5,000 | Unbounded leaves the matrix with ≈40k features at min_df=5, most of them sparse trigrams that contribute almost nothing to similarity but bloat memory and slow TruncatedSVD. 5,000 truncates too aggressively and loses meaningful trigrams ("work life balance", "long working hour"). 8,000 is the smallest cap that retains all unigrams that pass min_df *and* the top trigrams above the noise floor. |
+| `ngram_range` | **(1, 3)** | (1, 1) or (1, 2) | Glassdoor reviews are short (median ≈ 20 tokens after preprocessing). Multi-word concepts dominate the actual semantic content: "work life balance" is a single concept that loses meaning when split into unigrams, and a post-hoc justification showed "work life" and "life balance" appeared frequently across corpus; "senior management" carries a different signal from `senior` and `management` separately, which is also common in corporate lexicon. Restricting to (1, 1) collapses these into bag-of-words noise; (1, 2) misses the most diagnostic three-word phrase in the entire corpus ("work life balance"). The (1, 3) extension is feasible only because `max_features=8000` and `min_df=5` for each document together prevent the trigram space from exploding. |
+| `sublinear_tf` | **True** | False (default) | Without `sublinear_tf`, a review where the same term appears six times has six times the weight of a one-occurrence review. On Glassdoor this systematically over-weights long emotional reviews that repeat the same complaint and under-weights terse single-word labels like "balance". Sublinear scaling (log(1 + tf)) compresses repeated occurrences and stabilises pairwise cosine similarity across the order-of-magnitude length distribution observed in §1.1.2. |
+
+
+Pros and cons are vectorised with **separate** TF-IDF instances rather than one shared vocabulary. This is required because the two documents have systematically different vocabulary distributions (`balance`, `flexibility` are far more common in pros; `hour`, `manager`, `low` in cons), so a shared IDF would produce intermediate weights that under-discriminate on both sides. Separate fits let each field's IDF reflect its own corpus statistics.
+
+The matrix **density** printed above is the share of cells in the document-term matrix that are non-zero. In this case density is extremely low (pros TF-IDF matrix density = 0.00147, cons TF-IDF matrix density = 0.00138), it means most reviews contain only a tiny fraction of the vocabulary, so pairwise similarity is driven by a handful of exact token overlaps. That is why sparsity matters substantively: two reviews may be about the same experience but still look dissimilar in raw TF-IDF if they use slightly different words. The text-length evidence in Section 1.1 predicts this problem, and the observed sparse TF-IDF matrices confirm it. LSA is therefore motivated by **both**: the shortness of the documents creates the sparsity problem, and the measured matrix density shows its scale in the vector representation.
+
+### 3.4 LSA Dimensionality Reduction
+
+#### 3.4.1 The problem raw TF-IDF cannot solve
+
+Section 3.2 showed that the TF-IDF matrices are extremely sparse: most reviews activate only a tiny fraction of the vocabulary. This matters because TF-IDF treats every term independently. It does not know that "poor work-life balance" and "no time outside of work" describe closely related experiences, or that "supportive manager" and "good leadership" may point to the same underlying theme. Two reviews can therefore discuss the same workplace condition but still appear dissimilar if they use different words and share few exact non-zero entries.
+
+**Latent Semantic Analysis (LSA)** addresses this by looking for the underlying dimensions of term co-occurrence. Applied with **TruncatedSVD** to a sparse document-term matrix, it factorises the matrix as:
+
+$$
+\mathbf{M} \approx \mathbf{U}_k \mathbf{\Sigma}_k \mathbf{V}_k^\top
+$$
+
+where:
+
+- **UΣ** gives each review's coordinates in a lower-dimensional latent space
+- **V** gives the term loadings that define each latent dimension
+- retaining only the top *k* dimensions compresses the original matrix while preserving its strongest co-occurrence structure
+
+This is the role LSA plays here. I am not using it as a topic model in the Part B sense; I am using it as a **dimensionality-reduction step for sparse text**, so that similarity and anomaly detection operate in a denser, more semantically meaningful feature space than raw TF-IDF.
+
+#### 3.4.2 Choosing k: scree analysis
+
+```{python}
+#| label: lsa-k-choice
+
+K_GRID = list(range(10, 151, 10))  # 10, 20, ..., 150 — equal 10-step increments
+
+pros_cumvar = []
+cons_cumvar = []
+
+for k in K_GRID:
+    svd_tmp_pros = TruncatedSVD(n_components=k, random_state=42)
+    svd_tmp_cons = TruncatedSVD(n_components=k, random_state=42)
+
+    svd_tmp_pros.fit(X_pros)
+    svd_tmp_cons.fit(X_cons)
+
+    pros_cumvar.append(svd_tmp_pros.explained_variance_ratio_.sum())
+    cons_cumvar.append(svd_tmp_cons.explained_variance_ratio_.sum())
+
+pros_marginal = [pros_cumvar[0]] + [
+    pros_cumvar[i] - pros_cumvar[i - 1] for i in range(1, len(pros_cumvar))
+]
+cons_marginal = [cons_cumvar[0]] + [
+    cons_cumvar[i] - cons_cumvar[i - 1] for i in range(1, len(cons_cumvar))
+]
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+
+axes[0, 0].plot(K_GRID, pros_cumvar, marker='o', color='#4C9BE8', linewidth=1.6)
+axes[0, 0].axvline(100, color='red', linestyle='--', alpha=0.7, label='Chosen k = 100')
+axes[0, 0].set_title('Pros TF-IDF — cumulative variance explained', fontweight='bold')
+axes[0, 0].set_xlabel('Number of LSA dimensions (k)')
+axes[0, 0].set_ylabel('Cumulative variance explained')
+axes[0, 0].legend(fontsize=9)
+axes[0, 0].grid(alpha=0.3)
+
+axes[0, 1].plot(K_GRID, pros_marginal, marker='o', color='#E87A4C', linewidth=1.6)
+axes[0, 1].axvline(100, color='red', linestyle='--', alpha=0.7, label='Chosen k = 100')
+axes[0, 1].set_title('Pros TF-IDF — marginal gain per k step', fontweight='bold')
+axes[0, 1].set_xlabel('Number of LSA dimensions (k)')
+axes[0, 1].set_ylabel('Additional variance explained')
+axes[0, 1].legend(fontsize=9)
+axes[0, 1].grid(alpha=0.3)
+
+axes[1, 0].plot(K_GRID, cons_cumvar, marker='o', color='#4C9BE8', linewidth=1.6)
+axes[1, 0].axvline(100, color='red', linestyle='--', alpha=0.7, label='Chosen k = 100')
+axes[1, 0].set_title('Cons TF-IDF — cumulative variance explained', fontweight='bold')
+axes[1, 0].set_xlabel('Number of LSA dimensions (k)')
+axes[1, 0].set_ylabel('Cumulative variance explained')
+axes[1, 0].legend(fontsize=9)
+axes[1, 0].grid(alpha=0.3)
+
+axes[1, 1].plot(K_GRID, cons_marginal, marker='o', color='#E87A4C', linewidth=1.6)
+axes[1, 1].axvline(100, color='red', linestyle='--', alpha=0.7, label='Chosen k = 100')
+axes[1, 1].set_title('Cons TF-IDF — marginal gain per k step', fontweight='bold')
+axes[1, 1].set_xlabel('Number of LSA dimensions (k)')
+axes[1, 1].set_ylabel('Additional variance explained')
+axes[1, 1].legend(fontsize=9)
+axes[1, 1].grid(alpha=0.3)
+
+plt.suptitle('Marginal variance gain flattens after k≈100 — justifying k=100 components per field',
+             fontsize=12, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.show()
+
+print("Variance explained at key values of k:")
+for k, vp, vc in zip(K_GRID, pros_cumvar, cons_cumvar):
+    print(f"  k={k:>3}: pros={vp:.1%} | cons={vc:.1%}")
+```
+
+With equal 10-step increments, both the cumulative and marginal plots are directly comparable across the full range. The cumulative curves rise steeply at first and then flatten, with the elbow sitting at roughly 30–50 components for both pros and cons. The marginal-gain plots make this transition visible as a clear step-down: each successive 10-dimension block adds progressively less variance. The elbow is a guide rather than an absolute rule: I retain **100 dimensions per field** because the downstream tasks, pairwise similarity at firm level, Isolation Forest anomaly detection, and density-based clustering, require enough latent resolution to distinguish employers and unusual reviews within a large, cross-industry corpus. At k = 50 the cumulative variance is only ~15 %; at k = 100 it reaches ~22 %, capturing a meaningful additional slice of co-occurrence structure at negligible extra computational cost.
+
+The 23% cumulative variance at k = 100 looks low against textbook LSA (where 10 components often capture 50–60%) but is expected here: 150,000 short reviews × 8,000 features produce a document-term matrix of very high effective rank, and the corpus spans ~400 companies × 3 periods × 5 ratings, so variance is genuinely spread across hundreds of latent directions rather than concentrated in a few.
+
+The table below summarises the k-choice trade-offs.
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative on this corpus |
+|---|---|---|---|
+| `n_components` (per field) | **100** | 10–30 (textbook elbow) | At k = 30 the elbow is reached but cumulative variance is only ~13%, and the leading 30 axes are dominated by the content-vs-emptiness and WLB-naming-vs-narrative axes. With k = 30 there is no resolution left for firm-level distinction (§4) or per-review anomaly geometry (§5) — most reviews collapse onto a few dominant directions and cannot be distinguished. k = 100 retains the full variance-ordered tail that anomaly detection actually needs (Isolation Forest splits trees on whichever dimensions separate the data, so it benefits from more available axes). k = 200 was tested and adds ~3 percentage points of variance at 4× the SVD time without changing downstream rankings — not justified. |
+| `random_state` | **42** | unseeded | TruncatedSVD uses randomised SVD by default; without a fixed seed, repeat runs produce sign-flipped or slightly rotated bases, breaking the §3.4.4 dimension interpretations across re-runs. 42 is fixed for reproducibility. |
+| Algorithm | **TruncatedSVD** | dense PCA | TruncatedSVD operates directly on the sparse `(150 000, 8 000)` TF-IDF matrices without densification; PCA would require centring (which destroys sparsity) and densifying the matrix to ≈10 GB per field. TruncatedSVD on sparse input is the canonical LSA implementation and the only computationally viable option at this scale. |
+| Pros/cons fitted | **separately** | concatenated single SVD | Concatenating pros and cons into a single document and fitting one SVD would mix two structurally distinct vocabularies (positive evaluative vs negative evaluative), producing latent axes that mostly separate "is this the pros half or the cons half" rather than substantive content variation. Fitting separately preserves the analytical contrast — the cons-Dim 2 sign-flip vs pros-Dim 2 in §3.4.4 is informative precisely because the two SVDs are independent. |
+
+#### 3.4.3 L2 normalisation and the joint representation
+
+The 100-dimensional LSA outputs `X_pros_lsa_raw` and `X_cons_lsa_raw` are then **L2-normalised** row-by-row: each review vector is rescaled so that $\lVert \mathbf{x} \rVert_2 = 1$, projecting every review onto the unit hypersphere. This serves three purposes. First, it makes cosine similarity numerically equivalent to a dot product, so the firm-level pairwise similarity computation in §4 collapses to a single matrix multiplication `X_firm @ X_firm.T`. Second, it removes raw vector magnitude (a proxy for review length) as a confound — a 5-word and a 100-word review expressing the same idea are placed at the same position on the hypersphere. Third, it puts the pros and cons sides on a common scale before they are concatenated.
+
+The two L2-normalised matrices — pros at shape `(150 000, 100)` and cons at shape `(150 000, 100)` — are then horizontally stacked into the joint feature matrix `X_lsa` of shape `(150 000, 200)`. This concatenation (rather than averaging) preserves the structural separation of the two fields: pros-side latent axes occupy dimensions 0–99, cons-side latent axes occupy dimensions 100–199, so a reviewer who praises culture but criticises pay produces a vector with high loading on a pros-side relational axis and on a cons-side compensation axis simultaneously. After hstack each joint vector has norm $\sqrt{2}$ (the sum of two unit norms), so a **second L2-normalisation pass is applied to the joint matrix** to project it onto the unit hypersphere. This second normalisation is what makes cosine similarity numerically equal to the dot product in the joint space — without it, the firm-level similarities in §4 and review-pair similarities below would be inflated by a factor of up to $\sqrt{2}\cdot\sqrt{2}=2$. The 200-dim joint representation is the input to firm-level similarity (§4), Isolation Forest anomaly detection (§5.1), and the 3D semantic-space visualisation in §3.5.
+
+```{python}
+#| label: lsa-reduction
+
+N_COMPONENTS = 100
+
+svd_pros = TruncatedSVD(n_components=N_COMPONENTS, random_state=42)
+svd_cons = TruncatedSVD(n_components=N_COMPONENTS, random_state=42)
+
+X_pros_lsa_raw = svd_pros.fit_transform(X_pros)
+X_cons_lsa_raw = svd_cons.fit_transform(X_cons)
+
+# L2 normalisation places all reviews on the unit hypersphere so cosine
+# similarity is simply the dot product in downstream sections.
+X_pros_lsa = normalize(X_pros_lsa_raw)
+X_cons_lsa = normalize(X_cons_lsa_raw)
+
+# Concatenate → 200-dimensional joint representation.
+# After hstack, each joint vector has norm √2 (sum of two unit norms), so we
+# re-normalise so that the joint vector itself sits on the unit hypersphere.
+# This is what makes cosine similarity = dot product in §4 and §6.
+X_lsa = np.hstack([X_pros_lsa, X_cons_lsa])         # shape: (n_reviews, 200)
+X_lsa = normalize(X_lsa)                            # joint unit-norm
+
+exp_pros = svd_pros.explained_variance_ratio_.cumsum()[-1]
+exp_cons = svd_cons.explained_variance_ratio_.cumsum()[-1]
+print(f"\nCumulative variance explained by {N_COMPONENTS} components:")
+print(f"  Pros LSA: {exp_pros:.1%}")
+print(f"  Cons LSA: {exp_cons:.1%}")
+print(f"\nJoint LSA feature matrix: {X_lsa.shape}")
+```
+
+#### 3.4.4 Interpreting the latent dimensions (term loadings and example reviews)
+
+A naïve readout of the top-loading terms per LSA dimension produces two recurring artefacts that obscure the real semantic content of each axis. The first is **pure-repetition noise**: strings such as `money money`, `bad bad`, or `blah blah` survive the TF-IDF filter because `min_df=5` only requires a term to appear in five documents, and a small number of reviews genuinely contain repeated tokens (emphatic writing, typos, or placeholder text). These bigrams carry no semantic content but occasionally load strongly on a dimension precisely because they are rare and co-occur only with themselves. The second artefact is **n-gram overlap**: because the vectoriser is configured with `ngram_range=(1, 3)`, the phrase "work life balance" is represented simultaneously as the unigrams `work`, `life`, `balance`, the bigrams `work life`, `life balance`, and the trigram `work life balance`. All six forms load on the same dimension, so a raw top-6 list ends up showing one concept six times.
+
+To recover a readable summary of each dimension, the loading display is fine-tuned in two ways. First, a **repetition filter** drops any n-gram whose tokens are all identical (`len(set(tokens)) == 1`). Second, a **substring-dedup pass** keeps an n-gram only if it neither contains nor is contained by an already-kept term on the same pole, so the first representative of a concept wins the slot and later variants are skipped. To ensure the dedup pass has enough material to work with (otherwise dropping six near-duplicates from a top-6 would leave nothing), the candidate pool per pole is expanded from 6 to 40 terms before filtering down to 5. These adjustments are purely presentational — they do not alter the LSA decomposition or the downstream 200-dimensional review vectors, which still use the full unfiltered vocabulary.
+
+```{python}
+#| label: lsa-loadings
+
+vocab_pros = tfidf_pros.get_feature_names_out()
+vocab_cons = tfidf_cons.get_feature_names_out()
+
+def _dedup_terms(sorted_terms, n_terms):
+    kept = []
+    for t in sorted_terms:
+        toks = t.split()
+        if len(set(toks)) == 1 and len(toks) > 1:
+            continue
+        if any(t in k or k in t for k in kept):
+            continue
+        kept.append(t)
+        if len(kept) == n_terms:
+            break
+    return kept
+
+def print_top_loadings(svd, vocab, label, n_dims=4, n_terms=5, pool=40):
+    print(f"\n{label}")
+    print("-" * len(label))
+    for i, component in enumerate(svd.components_[:n_dims]):
+        pos_candidates = [vocab[j] for j in component.argsort()[-pool:][::-1]]
+        neg_candidates = [vocab[j] for j in component.argsort()[:pool]]
+        top_pos = _dedup_terms(pos_candidates, n_terms)
+        top_neg = _dedup_terms(neg_candidates, n_terms)
+        print(f"Dim {i+1:>2} (+) {' | '.join(top_pos)}")
+        print(f"       (-) {' | '.join(top_neg)}")
+        print()
+
+print_top_loadings(svd_pros, vocab_pros, label="Top pros-side loadings")
+print_top_loadings(svd_cons, vocab_cons, label="Top cons-side loadings")
+```
+
+```{python}
+#| label: lsa-dim2-examples
+
+def show_dim2_examples(scores, df_ref, field, label, n=3):
+    """Print reviews at the extremes of Dim-2 in the LSA space."""
+    top_idx = np.argsort(scores)[-n:][::-1]
+    bot_idx = np.argsort(scores)[:n]
+    print(f"\n{label} — Dim 2 POSITIVE pole (top {n}):")
+    for i in top_idx:
+        text = str(df_ref.iloc[i][field])[:200].replace('\n', ' ')
+        print(f"  [{scores[i]:+.3f}] {text}")
+    print(f"\n{label} — Dim 2 NEGATIVE pole (bottom {n}):")
+    for i in bot_idx:
+        text = str(df_ref.iloc[i][field])[:200].replace('\n', ' ')
+        print(f"  [{scores[i]:+.3f}] {text}")
+
+pros_dim2_scores = X_pros_lsa[:, 1]   # Dim 2 projection in L2-normalised pros space
+cons_dim2_scores = X_cons_lsa[:, 1]   # Dim 2 projection in L2-normalised cons space
+
+show_dim2_examples(pros_dim2_scores, sample, 'pros_clean', 'PROS')
+show_dim2_examples(cons_dim2_scores, sample, 'cons_clean', 'CONS')
+```
+
+The loading output confirms that the latent dimensions are semantically coherent. Each dimension is a statistical axis of maximum co-occurrence variance, not a labelled category, but the first few are directly interpretable from their top terms. The factorisation implicitly recovers term co-occurrence patterns: two terms that frequently appear in the same documents will be represented by similar row vectors in $\mathbf{V}_k^\top$, even if they never co-occur in the same sentence. This is the mechanism by which LSA can recognise that "poor work-life balance" and "no time outside of work" describe the same experience despite sharing no terms.
+
+**Dim 1** functions on both sides as a **content-vs-emptiness separator**. On the pros side, the negative pole captures the "I can't think of any pros / nothing comes to mind" non-response pattern; on the cons side, the negative pole captures firm-specific idioms and rare phrasing ("small fish in a big pond", HMRC, "till date"). In both cases Dim 1 isolates the long tail of low-content or off-distribution reviews from the substantive bulk of the corpus, confirming that the factorisation is recovering signal-vs-fringe structure cleanly.
+
+**Pros-Dim 2** captures **review density and framing**: the positive pole is occupied by terse bullet-list entries that name work-life balance as a single explicit benefit, while the negative pole contains long narrative reviews describing culture, collegial relationships, and employer reputation in paragraph form. The Dim-2 example reviews printed by the cell above confirm this: top-pole entries are 5–10 token WLB labels (*"life balance plus"*, *"serve internet life balance"*), while bottom-pole entries are multi-sentence PwC and IBM narratives praising people, salary, recognition and environment.
+
+**Cons-Dim 2** captures the same density contrast in mirror form, but with the sign flipped. Cons text is shorter on average and more often left effectively empty ("can't think of any cons"), so the artefact pole — `con:` used as a literal header, "can't think of any cons", plus concrete workload/pay terms — ends up on the *positive* side of Dim 2 rather than the negative. The Dim-2 example reviews on this pole confirm the artefact pattern (*"commute long perfect con think"*, *"con think access canteen building"*), while the negative pole holds terse *"balance"*/*"worke life balance"*/*"ideal life balance"* entries. The sign-flip is a property of the SVD's variance-ordering on this corpus and does not change the substantive interpretation: Dim 2 separates terse WLB labelling from the rest of the corpus on both fields.
+
+**Dims 3 and 4** capture more specific framing axes. On the pros side, Dim 3 separates instrumental compensation language (pay, salary, benefit) from developmental/relational language (a "great place to work and learn" with good people), and Dim 4 separates career-stage framing ("best/good place to start") from institutional-opportunity framing (the company offers opportunity and benefits). On the cons side, Dim 3 isolates concrete hours-and-pay grievances from a mixed WLB / "no-cons" pole, and Dim 4 separates "great company / no real cons" from concrete schedule-and-pay grievances. Together these axes capture the principal ways employees structure workplace language, validating the 200-dimensional joint space as a meaningful feature representation for similarity (§4) and anomaly detection (§5).
+
+### 3.5 Semantic space structure: rating, time, and company type
+
+Before proceeding to firm-level similarity, it is informative to examine which grouping dimensions, **who wrote the review** (company type: top-10 vs others), **when** (temporal period), and **how the reviewer felt** (overall rating), produce the most distinct clusters in the 200-dimensional LSA space. This serves two purposes: it validates that the LSA representation is capturing genuine content variation rather than noise, and it reveals which dimension is the primary driver of vocabulary structure, directly motivating Part B's research question.
+
+**Why visualise on the first three LSA dimensions directly, rather than a separate PCA?** TruncatedSVD in §3.4 already produces an orthogonal basis ordered by explained variance: Dim 1 is the direction of maximum variance in the TF-IDF input, Dim 2 the next-most-variant direction orthogonal to Dim 1, and so on. The first three dimensions therefore are *already* the best low-dimensional linear summary of the semantic space, and §3.4.4 has given them concrete term-level interpretations (content-vs-emptiness, WLB-naming vs narrative praise, instrumental vs relational). Plotting on these axes means the axes themselves are interpretable: a point's position on Dim 1 literally corresponds to its loading on the content-vs-emptiness axis, not on an abstract principal component of the reduced space. Fitting a fresh PCA on `X_lsa` would just produce a rotation of these same dimensions (the cumulative-variance ordering is preserved under orthogonal projection of an already-orthogonal basis) without adding information, and the rotated axes would lose the term-level interpretation built in §3.4.4.
+
+The visualisation uses **Plotly** for an interactive 3D scatter. A 10% random subsample (≈15,000 points) is shown rather than all 150k to keep the figure responsive; the centroid-distance table below is computed on the full sample.
+
+```{python}
+#| label: lsa-semantic-structure
+
+# Assign grouping labels on the working sample 
+top10_firms = sample['firm'].value_counts().head(10).index.tolist()
+sample['company_type'] = np.where(sample['firm'].isin(top10_firms), 'Top-10', 'Others')
+
+sample['period'] = pd.cut(
+    sample['year_review'],
+    bins=[2007, 2015, 2019, 2022],
+    labels=['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']
+).astype(str)
+
+# Build a DataFrame of the first 3 LSA dimensions (already variance-ordered) 
+df_lsa = pd.DataFrame(X_lsa[:, :3], columns=['Dim1', 'Dim2', 'Dim3'])
+df_lsa['rating']       = sample['overall_rating'].astype(str).values
+df_lsa['period']       = sample['period'].values
+df_lsa['company_type'] = sample['company_type'].values
+df_lsa['firm']         = sample['firm'].values
+df_lsa['hover_label']  = (sample['firm'].astype(str)
+                          + '  ·  ★' + sample['overall_rating'].astype(str)
+                          + '  ·  ' + sample['period'].astype(str)).values
+
+# Subsample for responsive plotting (centroid table below uses the full sample)
+VIS_N = min(15_000, len(df_lsa))
+df_vis = df_lsa.sample(n=VIS_N, random_state=42)
+
+# Plot 1 — coloured by rating tier 
+rating_palette = {'1': '#d32f2f', '2': '#f57c00', '3': '#fbc02d',
+                  '4': '#7cb342', '5': '#388e3c'}
+fig_rating = px.scatter_3d(
+    df_vis, x='Dim1', y='Dim2', z='Dim3',
+    color='rating', color_discrete_map=rating_palette,
+    category_orders={'rating': ['1', '2', '3', '4', '5']},
+    hover_name='hover_label',
+    title='LSA space (Dims 1–3) — coloured by rating tier',
+    opacity=0.55,
+)
+fig_rating.update_traces(marker=dict(size=2.2))
+fig_rating.update_layout(height=560,
+    legend_title_text='Rating (★)',
+    scene=dict(xaxis_title='Dim 1 (substantive content vs "no pros" non-answers)',
+               yaxis_title='Dim 2 (WLB-naming vs narrative praise)',
+               zaxis_title='Dim 3 (pay/instrumental vs relational/developmental)'))
+fig_rating.show()
+
+# Plot 2 — coloured by temporal period 
+period_palette = {'Early (2008–15)': '#78909c',
+                  'Mature (2016–19)': '#1565c0',
+                  'COVID (2020–21)': '#c62828'}
+fig_period = px.scatter_3d(
+    df_vis, x='Dim1', y='Dim2', z='Dim3',
+    color='period', color_discrete_map=period_palette,
+    category_orders={'period': list(period_palette.keys())},
+    hover_name='hover_label',
+    title='LSA space (Dims 1–3) — coloured by temporal period',
+    opacity=0.55,
+)
+fig_period.update_traces(marker=dict(size=2.2))
+fig_period.update_layout(height=560,
+    scene=dict(xaxis_title='Dim 1', yaxis_title='Dim 2', zaxis_title='Dim 3'))
+fig_period.show()
+
+# Plot 3 — coloured by company type (top-10 vs others) 
+ct_palette = {'Top-10': '#6a1b9a', 'Others': '#ef6c00'}
+fig_ct = px.scatter_3d(
+    df_vis, x='Dim1', y='Dim2', z='Dim3',
+    color='company_type', color_discrete_map=ct_palette,
+    hover_name='hover_label',
+    title='LSA space (Dims 1–3) — coloured by company type (top-10 vs others)',
+    opacity=0.55,
+)
+fig_ct.update_traces(marker=dict(size=2.2))
+fig_ct.update_layout(height=560,
+    scene=dict(xaxis_title='Dim 1', yaxis_title='Dim 2', zaxis_title='Dim 3'))
+fig_ct.show()
+
+# Inter-centroid cosine distances (computed on full sample)
+print("\nVocabulary divergence in LSA space (mean pairwise cosine distance between group centroids):")
+
+DIMS = {
+    'Rating (1–5★)':                ('overall_rating', [1, 2, 3, 4, 5]),
+    'Period (3 phases)':            ('period',         ['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']),
+    'Company type (top-10/others)': ('company_type',   ['Top-10', 'Others']),
+}
+for label, (col, levels) in DIMS.items():
+    cents = []
+    for lv in levels:
+        mask = sample[col].values == lv
+        if mask.sum() > 0:
+            c = X_lsa[mask].mean(axis=0)
+            norm = np.linalg.norm(c)
+            if norm > 0:
+                cents.append(c / norm)
+    if len(cents) >= 2:
+        mat   = np.vstack(cents)
+        dists = cosine_distances(mat)
+        upper = dists[np.triu_indices(len(mat), k=1)]
+        print(f"  {label:<38} {upper.mean():.4f}")
+```
+
+The three interactive 3D scatter plots and the centroid-distance table together reveal the degree to which each grouping dimension structures the 200-dimensional LSA space. **Rating tier** produces the clearest separation: 1★ and 5★ review clusters sit at opposite ends of LSA Dim 1 (the content-vs-emptiness axis identified in §3.4.4), with the 2★/3★/4★ tiers ordered monotonically between them — confirming that overall_rating is the primary axis of vocabulary variation in the corpus. **Temporal period** produces modest separation: COVID-era reviews shift slightly toward remote-work and job-insecurity vocabulary, but the three periods overlap substantially in the bulk of the space. **Company type** (top-10 vs others) produces the least separation, confirming that large and smaller employers write about workplace experience in structurally similar terms once rating is held constant — industry is not a primary driver of vocabulary variation in this corpus.
+
+This ordering — **rating ≫ period > company type** — has direct implications for Part B's research design. Because rating dominates the static LSA space, any temporal-shift signal estimated on the joint LSA representation alone would be confounded by the changing rating mix across periods. Part B therefore uses a different representation pipeline on the same stratified sample: dense **MiniLM sentence embeddings** + UMAP + BERTopic recover **topic** structure that is closer to paraphrase-level meaning than to surface vocabulary, and the analysis compares topic prevalence between the **pre-COVID (2008–19)** and **COVID (2020–21)** slices to surface workplace concerns that became more or less salient during the pandemic. The findings of §3.5 thus motivate the methodological split between Parts A and B: Part A leverages the rating-dominated LSA space for firm-level cohesion and review-level anomalies; Part B sidesteps that dominance to study temporal topic change.
+
+## 4 Similarity Analysis
+
+With the 200-dimensional joint LSA representation constructed, we now apply it to answer the first analytical question: within a given employer, how similar is the language employees use to describe their experience?
+
+### 4.1 Within-Firm Similarity
+
+```{python}
+#| label: within-firm-similarity
+
+
+# Only analyse firms with ≥ 20 reviews in the sample (sufficient for pairwise statistics)
+firm_review_counts = sample['firm'].value_counts()
+eligible_firms     = firm_review_counts[firm_review_counts >= 20].index.tolist()
+print(f"Firms with ≥ 20 reviews in sample: {len(eligible_firms)}")
+
+firm_sim_records = []
+MAX_FIRM_SAMPLE = 500   # cap per-firm pairwise computation (avoids O(n²) memory blowup)
+
+for firm in eligible_firms:
+    mask     = (sample['firm'] == firm).values
+    mask_idx = np.where(mask)[0]
+
+    # Subsample if firm has more reviews than the cap (e.g. IBM ~3,600 reviews at 50k sample)
+    if len(mask_idx) > MAX_FIRM_SAMPLE:
+        sub_idx      = np.random.choice(len(mask_idx), MAX_FIRM_SAMPLE, replace=False)
+        mask_idx_sub = mask_idx[sub_idx]
+    else:
+        mask_idx_sub = mask_idx
+
+    X_firm = X_lsa[mask_idx_sub]
+
+    # Pairwise cosine similarity: X is L2-normalised → dot product = cosine similarity
+    sim_matrix = X_firm @ X_firm.T
+    n = sim_matrix.shape[0]
+    upper_idx = np.triu_indices(n, k=1)
+    pairwise_sims = sim_matrix[upper_idx]
+
+    firm_sim_records.append({
+        'firm':       firm,
+        'n_reviews':  len(mask_idx),      # true review count (before cap)
+        'n_sampled':  n,                  # actual pairs computed (after cap)
+        'mean_sim':   float(pairwise_sims.mean()),
+        'median_sim': float(np.median(pairwise_sims)),
+        'std_sim':    float(pairwise_sims.std()),
+        'max_sim':    float(pairwise_sims.max()),
+        'min_sim':    float(pairwise_sims.min()),
+        'mask_idx':   mask_idx_sub,
+        'all_sims':   pairwise_sims,
+    })
+
+
+firm_sim_df = pd.DataFrame([
+    {k: v for k, v in r.items() if k not in ('all_sims', 'mask_idx')}
+    for r in firm_sim_records
+])
+
+print("\nTop 10 most internally CONSISTENT firms (highest mean within-firm similarity):")
+top_consistent = firm_sim_df.nlargest(10, 'mean_sim')[['firm', 'n_reviews', 'mean_sim', 'std_sim']]
+print(top_consistent.to_string(index=False))
+
+print("\nTop 10 most internally FRAGMENTED firms (lowest mean within-firm similarity):")
+top_fragmented = firm_sim_df.nsmallest(10, 'mean_sim')[['firm', 'n_reviews', 'mean_sim', 'std_sim']]
+print(top_fragmented.to_string(index=False))
+print(f"\nOverall mean within-firm similarity (all {len(firm_sim_df)} eligible firms): "
+      f"{firm_sim_df['mean_sim'].mean():.4f}  (median: {firm_sim_df['mean_sim'].median():.4f})")
+
+```
+
+```{python}
+#| label: firm-text-examples
+
+def show_most_similar_pair(firm_name):
+    rec = next((r for r in firm_sim_records if r['firm'] == firm_name), None)
+    if rec is None:
+        print(f"  {firm_name} not found in sample"); return
+    idx = rec['mask_idx']
+    sim = X_lsa[idx] @ X_lsa[idx].T
+    np.fill_diagonal(sim, -np.inf)
+    i, j = np.unravel_index(sim.argmax(), sim.shape)
+    ra, rb = sample.iloc[idx[i]], sample.iloc[idx[j]]
+    print(f"\n{'─'*70}")
+    print(f"MOST SIMILAR PAIR — {firm_name}  (similarity = {sim[i,j]:.3f})")
+    for r, tag in [(ra, 'A'), (rb, 'B')]:
+        print(f"  [Review {tag}]  Rating: {r['overall_rating']}★  |  Job: {str(r['job_title'])[:45]}")
+        print(f"    pros: {str(r['pros'])[:260]}")
+        print(f"    cons: {str(r['cons'])[:260]}")
+
+def show_most_divergent_pair(firm_name):
+    rec = next((r for r in firm_sim_records if r['firm'] == firm_name), None)
+    if rec is None:
+        print(f"  {firm_name} not found in sample"); return
+    idx = rec['mask_idx']
+    sim = X_lsa[idx] @ X_lsa[idx].T
+    np.fill_diagonal(sim, np.inf)
+    i, j = np.unravel_index(sim.argmin(), sim.shape)
+    ra, rb = sample.iloc[idx[i]], sample.iloc[idx[j]]
+    print(f"\n{'─'*70}")
+    print(f"MOST DIVERGENT PAIR — {firm_name}  (similarity = {sim[i,j]:.3f})")
+    for r, tag in [(ra, 'A'), (rb, 'B')]:
+        print(f"  [Review {tag}]  Rating: {r['overall_rating']}★  |  Job: {str(r['job_title'])[:45]}")
+        print(f"    pros: {str(r['pros'])[:260]}")
+        print(f"    cons: {str(r['cons'])[:260]}")
+
+print("=== TOP-CONSISTENT FIRMS (most-similar pair within each) ===")
+for f in ['Creative-Support', 'Mountain-Warehouse',
+          'Barchester-Healthcare', 'Foxtons', 'Wise']:
+    show_most_similar_pair(f)
+
+print("\n=== HOSPITALITY/SERVICES FRAGMENTATION ===")
+show_most_divergent_pair('Sodexo')
+```
+
+The printed tables reveal a pattern that is more nuanced than a simple sector narrative.
+
+**Most consistent firms.** The top-10 by mean within-firm similarity, after the joint L2-normalisation correction in §3.4.3 (which bounds cosine to [−1, 1]), is led by **Creative-Support (mean 0.156), Mountain-Warehouse (0.149), Barchester-Healthcare (0.1458), Foxtons (0.1457)**, and **Wise (0.1442)**. These are not large household-name employers， they are mid-sized, single-function workplaces whose workforce occupies a narrow occupational role: Creative-Support and Barchester-Healthcare are UK adult-social-care providers (support-worker / care-assistant vocabulary), Mountain-Warehouse and Foxtons are single-format retail and estate-agent chains (shop-floor and property-listing vocabulary), and Wise is a fintech with a tightly scoped engineering / operations workforce. The mechanism behind their high cohesion is the same one that drives consulting-firm cohesion in the literature: a narrow employee population doing structurally similar work, written about in a shared occupational vocabulary, produces tightly clustered review vectors.
+
+The `firm-text-examples` cell above prints the *single most-similar pair* within each of the top-consistent firms. The pairs all share the same structural signature: two reviewers, often at different rating tiers and different job titles, independently converging on the same compact set of pros and cons that describe the firm's operating model — care-work specifics for the social-care firms, schedule/commission specifics for retail and estate agency, product/team specifics for Wise. The consistency is therefore *occupational*: it is being driven by what the employer actually does, not by an abstract "culture" variable.
+
+**Most fragmented firms.** The most-divergent pair within **Sodexo** (similarity = **−0.208**, the floor of the similarity distribution after the joint normalisation) makes the fragmentation mechanism explicit. The printed pair contrasts an hourly catering worker (focused on pay, schedule, supervisors) with a professional employee (focused on client engagement, cross-cultural environment, career development): both give the same employer a 1★ rating, yet their `pros` and `cons` vocabularies are essentially orthogonal — the dot-product similarity falls to −0.208 in the joint LSA space. The fragmentation is not artefactual: it reflects a workforce spanning roles from food-service operative to corporate administrator that share an employer name but almost nothing else.
+
+The overall mean within-firm similarity across all 328 eligible firms is 0.087 (median 0.084), which establishes the benchmark for what follows. The interpretively meaningful quantity is firm *ordering* by mean similarity, not absolute level — at 200 dimensions in a multi-industry corpus, any single review activates only a small fraction of the latent axes, so absolute cosine values compress.
+
+### 4.2 Industry as a Potential Confounder
+
+Industry sector is not used as a primary grouping variable in this analysis, but it represents a meaningful source of latent confounding that deserves acknowledgement. Firms within the same sector, for example two large professional-services firms or two retail chains, may produce more similar reviews than firms in different sectors, not because their workplace cultures are genuinely more alike, but because they draw employees from the similar labour market segments, use the same operational vocabulary (shift, client, engagement, billing), and face the same structural working conditions (long hours in consulting; weekend shifts in retail). In that sense, industry membership may act as a **latent level** that inflates within-industry similarity over and above what firm-specific culture would predict.
+
+The downstream implication is that within-firm similarity scores should not be compared directly across industries without acknowledging that a consulting firm operating in a vocabulary-dense, highly-codified professional environment will structurally tend to produce more similar reviews than, say, a large retailer employing workers across dozens of distinct store formats and roles. High within-firm similarity in consulting may therefore reflect sector vocabulary convergence as much as genuine cultural coherence; low within-firm similarity in retail may reflect workforce heterogeneity rather than cultural fragmentation. This confounding is not corrected for in the current analysis, and it is noted as a limitation in §10.1.
+
+### 4.3 Within-Firm Similarity Visualisation
+
+```{python}
+#| label: similarity-boxplot
+
+# Show within-firm similarity distributions for the top-20 firms by review count
+top20_firms = firm_sim_df.nlargest(20, 'n_reviews')['firm'].tolist()
+
+firm_rows = []
+for record in firm_sim_records:
+    if record['firm'] not in top20_firms:
+        continue
+    sims = record['all_sims']
+    if len(sims) > 1_000:
+        sims = np.random.choice(sims, 1_000, replace=False)
+    for s in sims:
+        firm_rows.append({'firm': record['firm'], 'n_reviews': record['n_reviews'], 'similarity': float(s)})
+
+firm_long = pd.DataFrame(firm_rows)
+
+# Order by descending median similarity
+firm_order_list = (
+    firm_long.groupby('firm')['similarity'].median()
+    .sort_values(ascending=False).index.tolist()
+)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+sns.boxplot(
+    data=firm_long, y='firm', x='similarity',
+    order=firm_order_list, ax=ax, color='#4C9BE8',
+    flierprops=dict(marker='.', markersize=2, alpha=0.3)
+)
+ax.axvline(firm_sim_df['mean_sim'].mean(), color='red', linestyle='--',
+           linewidth=1.2, label=f"Overall mean = {firm_sim_df['mean_sim'].mean():.3f}")
+ax.set_xlabel('Pairwise cosine similarity', fontsize=11)
+ax.set_ylabel('Company (top 20 by review count)', fontsize=11)
+ax.set_title('Within-company similarity varies substantially across firms —\n'
+             'cultural cohesion is firm-specific, not industry-wide',
+             fontsize=12, fontweight='bold')
+ax.legend(fontsize=9)
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("Within-firm similarity summary (top 20 firms):")
+print(firm_sim_df[firm_sim_df['firm'].isin(top20_firms)]
+      .sort_values('mean_sim', ascending=False)
+      [['firm', 'n_reviews', 'mean_sim', 'std_sim']].to_string(index=False))
+```
+
+The boxplot reveals substantial variation in within-firm review consistency. Firms at the top of the ranked list tend to be operationally homogeneous employers: retail and fast-food chains where the role vocabulary is tightly constrained by the job type. Firms toward the bottom employ workers across highly diverse roles, seniority levels, and geographies, producing reviews whose vocabulary spans distinct registers within the same employer brand. The red dashed line marks the overall mean similarity across all **328 eligible firms** (mean 0.087), providing a corpus-wide benchmark. As noted in §4.2, these firm-level scores are partially confounded by industry-level vocabulary convergence and should be interpreted comparatively rather than as absolute measures of cultural coherence.
+
+
+## 5 Anomaly Detection
+
+The similarity analysis has established what is typical within and across firms. We now turn to the complementary question: which reviews fall furthest from these established patterns, and why?
+
+### 5.1 Primary Method: Isolation Forest
+
+Isolation Forest detects anomalies by randomly partitioning the feature space: points that can be isolated in fewer random splits are anomalies. Applied to the 200-dimensional joint LSA representation, it flags reviews whose vocabulary pattern, across both the pros and cons fields simultaneously, is far from the dense core of the distribution, without requiring a specified neighbourhood radius (unlike LOF) or a parametric distributional assumption (unlike Gaussian-based methods). An important interpretive caveat applies: because the feature space has 200 dimensions, a review can occupy an unusual position in that space for reasons that are not legible in the text itself. A perfectly ordinary-sounding review may combine latent dimensions in a way that happens to be rare in the corpus; conversely, a structurally bizarre review may fall near the centroid if its vocabulary matches the average pattern. For this reason, Isolation Forest scores are best read as **distributional rarity** signals rather than as direct indicators of suspicious or dishonest content.
+
+```{python}
+#| label: isolation-forest
+
+iso_forest = IsolationForest(
+    n_estimators=200,
+    contamination=0.05,   # Flag the most anomalous 5 % of reviews
+    random_state=42,
+    n_jobs=-1
+)
+iso_forest.fit(X_lsa)
+
+# Raw decision scores: more negative = more anomalous
+sample['anomaly_score'] = iso_forest.decision_function(X_lsa)
+sample['is_anomaly']    = (iso_forest.predict(X_lsa) == -1)
+
+n_anom = sample['is_anomaly'].sum()
+print(f"Isolation Forest flagged: {n_anom:,} anomalies "
+      f"({n_anom / len(sample) * 100:.1f}% of sample)\n")
+
+print("Anomaly rate by rating tier:")
+anom_by_rating = (sample.groupby('overall_rating')['is_anomaly']
+                  .agg(n_reviews='count', n_anomalous='sum', anomaly_rate='mean')
+                  .assign(anomaly_rate=lambda x: x['anomaly_rate'].map('{:.2%}'.format)))
+print(anom_by_rating.to_string())
+
+# Distribution of anomaly scores
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.hist(sample[~sample['is_anomaly']]['anomaly_score'], bins=60,
+        color='#4C9BE8', alpha=0.7, label='Normal reviews', density=True)
+ax.hist(sample[sample['is_anomaly']]['anomaly_score'], bins=30,
+        color='#E84C4C', alpha=0.8, label='Anomalous reviews', density=True)
+ax.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.6, label='Decision boundary (0)')
+ax.set_xlabel('Isolation Forest decision score', fontsize=11)
+ax.set_ylabel('Density', fontsize=11)
+ax.set_title('Anomaly scores form a heavy left tail — the bottom ~5% are candidates for manual inspection',
+             fontsize=12, fontweight='bold')
+ax.legend(fontsize=9)
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+The Isolation Forest flagged **7,500 reviews, exactly 5.0%** of the 150,000-review sample, consistent with the `contamination=0.05` threshold. A flat contamination rate does not mean the method is uninformative: the anomaly *score distribution* reveals structure beyond the binary flag, with very negative decision scores forming a heavy left tail well below the decision boundary while the bulk of the corpus sits comfortably above it.
+
+The anomaly rate declines monotonically with rating: **1★ 6.96%, 2★ 6.67%, 3★ 5.36%, 4★ 4.69%, 5★ 4.04%**. Reviews at bottom-tier reviews are roughly 1.7× more likely to be flagged than top-tier ones. Two mechanisms are consistent with this. First, negative writing is more idiosyncratic: low-rated reviews include longer, less-templated grievance narratives that drift from the dense centre of the LSA vocabulary, while high-rated reviews cluster around formulaic positives ("great place to work", "good people") and sit closer to the corpus mean. Second, the dense LSA centre is itself rating-positively-skewed (§3.5), so the geometric "normality" IF learns leans toward positive vocabulary, the IF and rating axes are partially correlated, which is why §5.2's RTD is added as a complementary signal.
+
+### 5.2 Secondary Signal: Rating–Text Divergence
+
+The Isolation Forest captures linguistic unusualness but is blind to the relationship between text and rating. A sociologically more interesting type of anomaly is the **rating–text divergent review**: a 5-star review whose vocabulary closely resembles 1-star reviews, or vice versa. These cases suggest that either the numerical rating or the free text is systematically misleading, a distinction with real consequences for platforms that aggregate ratings as employer quality signals.
+
+**How text valence is computed.** Rather than importing an off-the-shelf sentiment score, I construct a valence signal **inside the LSA space already built in §3.4**. The procedure has three steps:
+
+1. For each rating tier *r* ∈ {1, 2, 3, 4, 5}, compute the arithmetic mean of all 200-dim LSA vectors of reviews with that rating. This gives five rating-tier centroids in the same space the similarity and anomaly analyses operate in.
+2. L2-normalise the centroids for the two extreme tiers (c₁ and c₅) so that dot-products reduce to cosine similarities.
+3. For every review's LSA vector **x**, define *text valence* as:
+$$
+\text{text\_valence}(\mathbf{x}) \;=\; \mathbf{x} \cdot \hat{\mathbf{c}}_5 \;-\; \mathbf{x} \cdot \hat{\mathbf{c}}_1
+$$
+This is the difference between the review's cosine similarity to the 5-star vocabulary centroid and its cosine similarity to the 1-star centroid. Values near +1 mean the review's vocabulary strongly resembles 5-star reviews; values near −1 mean it resembles 1-star reviews; values near 0 mean it is either neutral or loads equally on both.
+
+**Why an LSA-centroid approach rather than a supervised classifier?** Within the toolkit (bag-of-words, TF-IDF, LSA, SVMs), the alternative route to a valence score would be to train a **supervised classifier**, for example a linear SVM on TF-IDF features with overall_rating (or a binarised positive/negative label) as the target, and use its decision function as the sentiment score. I deliberately chose the unsupervised LSA-centroid approach instead, for three reasons.
+
+First and most importantly, **coherence with the rest of the pipeline**. Text valence defined via LSA centroids uses exactly the same representation space as the similarity analysis in §4 and the Isolation Forest anomaly score in §5.1. This means the RTD score and the IF score are directly combinable in the composite anomaly measure without cross-space calibration. A TF-IDF SVM would live in the raw high-dimensional sparse space rather than the 200-dim LSA space, so its output would need ad-hoc rescaling to combine with the Isolation Forest score, and the composite measure would be harder to interpret.
+
+Second, a supervised classifier trained to predict overall_rating from text would, by construction, minimise the gap between text and rating: the whole point of training such a model is to make text vocabulary track the rating label. Using its decision function as the valence signal would then guarantee low rating–text divergence on any review the classifier fits well, which is the opposite of what the anomaly task needs. The LSA-centroid approach is estimated without reference to any individual review's rating: each review's valence is a projection of its vector onto the average 5-star direction minus the average 1-star direction, so a review can freely diverge from its own rating without the method having been trained to prevent that.
+
+Third, the LSA-centroid approach approximates "positive vocabulary" as *the vocabulary actually used by 5-star reviewers in this corpus* and "negative vocabulary" as *the vocabulary used by 1-star reviewers*. This is empirically grounded in the dataset itself rather than a decision boundary learned by a classifier whose coefficients depend on regularisation strength, loss function, and class-weighting choices. The centroid is a simple, interpretable quantity: the average position of rating-tier *r* in the same LSA space used elsewhere.
+
+The cost of this choice is that text valence is bounded by how well the 1-star and 5-star centroids separate in LSA space. If the two extremes use overlapping vocabulary, the valence signal will be compressed. The rating-tier centroid distances computed in §3.5 (ordering rating >> period > company type) confirm that these centroids are well separated, so the signal is informative.
+
+```{python}
+#| label: rating-text-divergence
+
+
+# Compute LSA centroid for each rating tier
+centroids = {}
+for rating in [1, 2, 3, 4, 5]:
+    mask = (sample['overall_rating'] == rating).values
+    centroids[rating] = X_lsa[mask].mean(axis=0)
+
+# Normalise centroids to unit vectors
+c1_norm = centroids[1] / np.linalg.norm(centroids[1])
+c5_norm = centroids[5] / np.linalg.norm(centroids[5])
+
+# Text valence: how much more a review resembles 5-star vs 1-star language.
+# The raw difference lives on an arbitrary scale (roughly [−0.4, 0.4]); we rescale
+# it linearly onto the same 1–5 scale as overall_rating so that the two axes are
+# directly comparable. The anchors are the tier centroids themselves: the mean
+# raw valence of 1★ reviews maps to 1, and the mean raw valence of 5★ reviews
+# maps to 5. This makes "text valence = 4.2" mean "this text reads like a 4★ review".
+raw_text_valence = X_lsa @ c5_norm - X_lsa @ c1_norm
+tier_means = {r: raw_text_valence[(sample['overall_rating'] == r).values].mean()
+              for r in [1, 2, 3, 4, 5]}
+lo, hi = tier_means[1], tier_means[5]
+sample['text_valence'] = 1 + 4 * (raw_text_valence - lo) / (hi - lo)
+
+# Rating valence: keep a [−1, +1] mirror for the RTD calculation below (so RTD
+# stays on a familiar symmetric scale); the scatter plot uses overall_rating directly.
+sample['rating_valence']  = (sample['overall_rating'] - 3) / 2.0
+
+# Rating–text divergence: absolute gap between stated rating (1–5) and text valence
+# (now also on the 1–5 scale, so the gap has a direct interpretation in "stars").
+sample['rating_text_divergence'] = np.abs(
+    sample['text_valence'] - sample['overall_rating'])
+
+# Composite anomaly score: 60 % IF (inverted) + 40 % RTD (both normalised to [0,1])
+# Weighting rationale: IF captures broad linguistic unusualness across the full 200-dim space
+# and is therefore the primary signal; RTD adds specificity by flagging rating-text
+# inconsistency, which is sociologically meaningful but noisier (it can be triggered by
+# deliberately ironic or hedged writing that is genuinely consistent). 60/40 gives IF
+# primacy while ensuring RTD meaningfully adjusts scores for divergent-rating reviews.
+scaler = MinMaxScaler()
+sample['if_score_norm'] = scaler.fit_transform(
+    (-sample['anomaly_score']).values.reshape(-1, 1)).ravel()
+sample['rtd_norm'] = scaler.fit_transform(
+    sample['rating_text_divergence'].values.reshape(-1, 1)).ravel()
+sample['composite_anomaly'] = 0.6 * sample['if_score_norm'] + 0.4 * sample['rtd_norm']
+
+print("Rating–text divergence by rating tier:")
+rtd_summary = sample.groupby('overall_rating')['rating_text_divergence'].describe().round(3)
+print(rtd_summary.to_string())
+
+# Scatter: overall rating (1–5, jittered) vs text valence, split into
+# (a) normal reviews (grey, background) and (b) top-5% composite anomalies (viridis, foreground).
+# This makes the anomaly colour variation actually visible instead of being washed out
+# by the 95% bulk of near-zero-anomaly points.
+fig, ax = plt.subplots(figsize=(9, 6))
+
+rng = np.random.default_rng(42)
+x_jitter = sample['overall_rating'].values + rng.uniform(-0.18, 0.18, size=len(sample))
+
+anom_threshold = sample['composite_anomaly'].quantile(0.95)
+is_anom = (sample['composite_anomaly'] >= anom_threshold).values
+
+# Background: normal reviews in light grey
+ax.scatter(
+    x_jitter[~is_anom], sample['text_valence'].values[~is_anom],
+    c='lightgrey', s=4, alpha=0.25, label='Normal reviews (bottom 95%)', rasterized=True
+)
+# Foreground: top-5% anomalies coloured by composite anomaly score
+sc = ax.scatter(
+    x_jitter[is_anom], sample['text_valence'].values[is_anom],
+    c=sample['composite_anomaly'].values[is_anom],
+    cmap='viridis', s=14, alpha=0.85, edgecolors='black', linewidths=0.2,
+    label=f'Top-5% anomalies (score ≥ {anom_threshold:.2f})', rasterized=True
+)
+
+# Median text valence per rating — a visual "expected alignment" curve
+med_by_rating = sample.groupby('overall_rating')['text_valence'].median()
+ax.plot(med_by_rating.index, med_by_rating.values, 'k--', linewidth=1.5,
+        label='Median text valence per rating (expected alignment)')
+
+# True y=x alignment reference (both axes now on the 1–5 scale)
+ax.plot([1, 5], [1, 5], color='red', linewidth=1.0, alpha=0.5,
+        label='Perfect alignment (text = rating)')
+ax.set_xticks([1, 2, 3, 4, 5])
+ax.set_yticks([1, 2, 3, 4, 5])
+ax.set_xlim(0.5, 5.5)
+ax.set_ylim(0.5, 5.5)
+ax.set_xlabel('Overall rating (1–5 stars)', fontsize=11)
+ax.set_ylabel('Text valence  (LSA-derived, rescaled to 1–5 scale)', fontsize=11)
+ax.set_title('Text valence tracks stated rating monotonically, but top-5% anomalies\n'
+             'concentrate off the diagonal — rating–text divergence is a real signal',
+             fontsize=12, fontweight='bold')
+plt.colorbar(sc, label='Composite anomaly score (top-5% shown)')
+ax.legend(fontsize=9, loc='upper left')
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Summary statistics
+above_diag = (sample['text_valence'] > sample['overall_rating']).mean()
+below_diag = (sample['text_valence'] < sample['overall_rating']).mean()
+print(f"\nReviews with text MORE positive than rating: {above_diag:.1%}")
+print(f"Reviews with text MORE negative than rating: {below_diag:.1%}")
+```
+
+The scatter plot shows the expected monotonic relationship — median text valence rises from clearly negative at 1★ to clearly positive at 5★ — but the top-5% anomalies (coloured points) concentrate *away* from this median trend. Anomalies above the 1★/2★ median (low rating, positive-sounding text) often represent the "disappointed idealist" pattern: an employee who genuinely valued aspects of the job but felt compelled to leave a low rating after a specific negative incident (a failed promotion, a layoff). Anomalies below the 4★/5★ median (high rating, negative-sounding text) are more concerning analytically, as they may indicate that the reviewer either misunderstood the rating scale or provided a socially desirable rating while embedding their true assessment in the free-text fields.
+
+### 5.3 Top Anomalous Reviews with Text Excerpts
+
+To reflect the distinction between the two anomaly signals, the top reviews are presented separately: first the ten with the highest **rating–text divergence** (RTD), reviews where stated rating and textual valence most strongly contradict each other, and then the ten with the most extreme **Isolation Forest score** (distributional rarity in LSA space).
+
+```{python}
+#| label: top-anomalies
+
+cols = ['firm', 'overall_rating', 'pros', 'cons',
+        'anomaly_score', 'rating_text_divergence', 'composite_anomaly',
+        'sample_words', 'rating_valence', 'text_valence']
+
+# ── Table A: Top 10 by Rating–Text Divergence ────────────────────────────────
+top_rtd = sample.nlargest(10, 'rating_text_divergence')[cols].reset_index(drop=True)
+
+print("TABLE A — TOP 10 BY RATING–TEXT DIVERGENCE (text contradicts stated rating)")
+print("=" * 72)
+for i, row in top_rtd.iterrows():
+    direction = ("text MORE NEGATIVE than rating"
+                 if row['rating_valence'] > row['text_valence']
+                 else "text MORE POSITIVE than rating")
+    print(f"\nRank {i+1} | {row['firm']} | {row['overall_rating']}★ | {direction}")
+    print(f"  RTD: {row['rating_text_divergence']:.4f}  "
+          f"| IF score: {row['anomaly_score']:.4f}  "
+          f"| Words: {row['sample_words']}")
+    print(f"  PROS: {str(row['pros'])[:240]}")
+    print(f"  CONS: {str(row['cons'])[:240]}")
+    print("-" * 72)
+
+# ── Table B: Top 10 by Isolation Forest score ────────────────────────────────
+top_if = sample.nsmallest(10, 'anomaly_score')[cols].reset_index(drop=True)
+
+print("\n\nTABLE B — TOP 10 BY ISOLATION FOREST SCORE (most peripheral in 200-dim LSA space)")
+print("=" * 72)
+for i, row in top_if.iterrows():
+    print(f"\nRank {i+1} | {row['firm']} | {row['overall_rating']}★ | Words: {row['sample_words']}")
+    print(f"  IF score: {row['anomaly_score']:.4f}  "
+          f"| RTD: {row['rating_text_divergence']:.4f}  "
+          f"| Composite: {row['composite_anomaly']:.4f}")
+    print(f"  PROS: {str(row['pros'])[:240]}")
+    print(f"  CONS: {str(row['cons'])[:240]}")
+    print("-" * 72)
+```
+
+**Table A (high RTD)** shows the sociologically interesting anomalies: reviews where the stated star rating and the textual valence pull in opposite directions. A 5-star review that reads as neutral or negative in the LSA space, or a 1-star review whose vocabulary more closely resembles positive reviews, represents a genuine inconsistency, either between the reviewer's conscious rating and their embedded sentiment, or between their public and private assessments of the employer. These cases are directly interpretable and their anomalous character is legible in the text.
+
+**Table B (high IF score)** shows a different phenomenon. These reviews occupy unusual positions in the 200-dimensional LSA space, but they typically appear structurally normal, vocabulary-normal, and rating-aligned when read as text. This is not a failure of the method but a consequence of the high-dimensional feature space: a review can combine latent dimensions in a way that is rare in the corpus, occupying a low-density region, without any single textual feature being obviously anomalous. The Isolation Forest score therefore measures **distributional rarity**, not human-readable deviance. Its practical value is less in identifying specific suspicious reviews and more in establishing the shape of the anomaly distribution and confirming that the flagged fraction (5%) is not simply the set of most negative or most positive reviews (rather than tracking rating one-to-one — §5.1 shows IF *is* partially correlated with rating, but the score additionally captures distributional rarity that is orthogonal to valence).
+
+```{python}
+dup_mask_all   = sample.duplicated(subset=['firm', 'pros', 'cons', 'overall_rating'], keep=False)
+dup_mask_extra = sample.duplicated(subset=['firm', 'pros', 'cons', 'overall_rating'])  # default keep='first'
+
+n_extra  = int(dup_mask_extra.sum())   # rows that would be removed by drop_duplicates
+n_all    = int(dup_mask_all.sum())     # rows involved in any duplicate group
+n_groups = n_all - n_extra             # number of distinct duplicate groups (= number of "originals")
+
+print(f"Duplicate-group originals: {n_groups:,}")
+print(f"Extra duplicate rows:      {n_extra:,}  ({n_extra/len(sample)*100:.2f}% of sample)")
+print(f"Rows in any duplicate group: {n_all:,}  ({n_all/len(sample)*100:.2f}% of sample)")
+```
+
+*Note on Table B Rank 4 and Rank 5.* The two IBM rows ("Sky is the limit in innovation" / "too many management layers") are identical because the source corpus contains a small number of duplicate review submissions (same firm, same pros, same cons, same rating). Diagnosed at sample level: 1,119 extra duplicate rows out of 150,001 (0.75 % of the sample), distributed across 1,119 distinct duplicate groups — i.e. each duplicate group contains exactly two copies, and there are no triplicates. Full deduplication on (firm, pros, cons, overall_rating) is left to deployment; at 0.75 % of the sample the §4 firm-similarity rankings and the §5.1 5% anomaly fraction are robust to the duplicates.
+
+## 6 Comparison: What Similarity and Anomaly Reveal Together
+
+Having characterised similarity and anomaly independently, we now ask whether they are empirically related, and what the combination reveals that neither perspective could show alone.
+
+### 6.1 Cross-tabulation: Anomaly × Firm Similarity
+
+```{python}
+#| label: sim-anomaly-crosstab
+
+# Compute each review's cosine similarity to its own firm's centroid
+firm_centroids = {}
+for firm in eligible_firms:
+    mask = (sample['firm'] == firm).values
+    firm_centroids[firm] = X_lsa[mask].mean(axis=0)
+
+sample['firm_centroid_sim'] = np.nan
+for firm, centroid in firm_centroids.items():
+    mask = (sample['firm'] == firm).values
+    c_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
+    sample.loc[mask, 'firm_centroid_sim'] = X_lsa[mask] @ c_norm
+
+# Binarise: above overall median = "high similarity to firm centroid"
+median_fcs = sample['firm_centroid_sim'].median()
+sample['high_firm_sim'] = sample['firm_centroid_sim'] > median_fcs
+
+# Cross-tabulation
+ct = pd.crosstab(
+    sample['is_anomaly'], sample['high_firm_sim'],
+    rownames=['Anomalous (IF)'], colnames=['High firm-centroid similarity']
+)
+ct_pct = ct.div(ct.sum(axis=1), axis=0).round(3) * 100
+
+print("Cross-tabulation: Isolation Forest anomaly × Firm-centroid similarity")
+print(ct)
+print("\nRow percentages (% of anomalous / normal reviews with high firm-centroid similarity):")
+print(ct_pct)
+
+# Additional insight: among anomalous reviews, what fraction also has HIGH firm similarity?
+# These are "clustered anomalies" — reviews unusual vs corpus but similar to their firm peers
+anom_high_fcs = sample[sample['is_anomaly'] & sample['high_firm_sim']]
+print(f"\n'Clustered anomalies' (anomalous to corpus yet similar to firm centroid): "
+      f"{len(anom_high_fcs):,} reviews ({len(anom_high_fcs)/sample['is_anomaly'].sum()*100:.1f}% "
+      f"of all anomalies)")
+if len(anom_high_fcs) > 0:
+    print(f"Top firms producing clustered anomalies:")
+    print(anom_high_fcs['firm'].value_counts().head(8).to_string())
+```
+
+**Robustness check: §6 cross-tab on deduplicated sample.** The §5.3 diagnostic identified 1,119 duplicate rows. Re-running the §6 cross-tab on the deduplicated sample tests whether the headline finding (3,274 clustered anomalies, 43.7% of all flagged) survives removal of these rows.
+
+```{python}
+# Re-run §6 cross-tab on deduplicated sample
+dedup_mask = ~sample.duplicated(subset=['firm', 'pros', 'cons', 'overall_rating'])
+sample_dd  = sample.loc[dedup_mask].copy()
+X_lsa_dd   = X_lsa[dedup_mask.values]
+
+# Recompute firm centroids on the dedup'd sample
+firm_centroids_dd = {}
+for firm in eligible_firms:
+    m = (sample_dd['firm'] == firm).values
+    if m.sum() > 0:
+        firm_centroids_dd[firm] = X_lsa_dd[m].mean(axis=0)
+
+# Each review's similarity to its own firm centroid
+sample_dd['firm_centroid_sim'] = np.nan
+for firm, centroid in firm_centroids_dd.items():
+    m = (sample_dd['firm'] == firm).values
+    c_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
+    sample_dd.loc[m, 'firm_centroid_sim'] = X_lsa_dd[m] @ c_norm
+
+# Binarise at the dedup'd sample's own median (so the 50/50 split is preserved)
+median_fcs_dd = sample_dd['firm_centroid_sim'].median()
+sample_dd['high_firm_sim'] = sample_dd['firm_centroid_sim'] > median_fcs_dd
+
+# Cross-tab
+ct_dd     = pd.crosstab(sample_dd['is_anomaly'], sample_dd['high_firm_sim'],
+                        rownames=['Anomalous (IF)'],
+                        colnames=['High firm-centroid similarity'])
+ct_pct_dd = ct_dd.div(ct_dd.sum(axis=1), axis=0).round(3) * 100
+
+n_anom_dd           = int(sample_dd['is_anomaly'].sum())
+n_clustered_anom_dd = int((sample_dd['is_anomaly'] & sample_dd['high_firm_sim']).sum())
+pct_clustered_dd    = n_clustered_anom_dd / n_anom_dd * 100
+
+print(" §6.1 robustness: cross-tab on deduplicated sample ")
+print(f"Sample size after dedup:      {len(sample_dd):,}  "
+      f"({len(sample_dd)/len(sample)*100:.2f}% of original)")
+print(f"Anomalies after dedup:        {n_anom_dd:,}  "
+      f"({n_anom_dd/len(sample_dd)*100:.2f}% of dedup'd sample)")
+print(f"\nDedup'd cross-tab (row %):")
+print(ct_pct_dd)
+print(f"\n'Clustered anomalies' (dedup'd): {n_clustered_anom_dd:,} "
+      f"({pct_clustered_dd:.1f}% of all anomalies)")
+print(f"Original (with duplicates):      3,274 (43.7%)")
+print(f"Δ in clustered-anomaly count:    {n_clustered_anom_dd - 3274:+,}")
+print(f"Δ in clustered-anomaly fraction: {pct_clustered_dd - 43.7:+.2f} pp")
+```
+
+The dedup'd sample contains 148,882 reviews (99.25% of the original 150,001). The cross-tab headline survives removal of duplicates: 3,239 reviews (43.5%) remain clustered anomalies, against the original 3,274 (43.7%), a shift of −35 rows and −0.17 pp. The duplicate rows therefore contribute roughly proportionally to both the anomaly bucket and the high-firm-centroid bucket, and the §6 mechanism (corpus-wide anomaly detection over-flagging firms with distinctive in-house vocabulary) is robust to deduplication. The methodological loop opened by §5.3's duplicate diagnostic is therefore closed.
+
+### 6.2 2D Visualisation in LSA Space (Dims 1–2)
+
+For the same reasoning given in §3.5, this visualisation projects anomalies onto **LSA Dim 1 and Dim 2 directly** rather than fitting a separate PCA: Dim 1 is the variance-dominant content-vs-emptiness axis and Dim 2 is the WLB-naming-vs-narrative-praise axis identified by the loading analysis in §3.4.4. Plotting on these axes means each point's position is interpretable in the same vocabulary terms used everywhere else in Part A.
+
+```{python}
+#| label: scatter-lsa
+
+# Use LSA Dim 1 and Dim 2 directly (variance-ordered; interpretations in §3.4.4)
+X_2d = X_lsa[:, :2]
+
+# Subsample 5 000 points for plot performance
+rng      = np.random.default_rng(42)
+plot_idx = rng.choice(len(sample), 5_000, replace=False)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left panel: colour by composite anomaly score
+sc1 = axes[0].scatter(
+    X_2d[plot_idx, 0], X_2d[plot_idx, 1],
+    c=sample['composite_anomaly'].values[plot_idx],
+    cmap='YlOrRd', s=5, alpha=0.6
+)
+axes[0].set_title('Anomalies are spatially dispersed, not a single tight cluster —\nconfirming Isolation Forest captures diverse forms of unusualness',
+                  fontsize=12, fontweight='bold')
+axes[0].set_xlabel('LSA Dim 1 (signal vs noise / valence)')
+axes[0].set_ylabel('LSA Dim 2 (review density / WLB framing)')
+plt.colorbar(sc1, ax=axes[0], label='Composite anomaly score')
+
+# Right panel: colour by overall rating
+sc2 = axes[1].scatter(
+    X_2d[plot_idx, 0], X_2d[plot_idx, 1],
+    c=sample['overall_rating'].values[plot_idx],
+    cmap=cm.RdYlGn, s=5, alpha=0.6, vmin=1, vmax=5
+)
+axes[1].set_title('Rating is the dominant axis of LSA space —\npositive and negative vocabulary separate cleanly along Dim 1',
+                  fontsize=12, fontweight='bold')
+axes[1].set_xlabel('LSA Dim 1 (signal vs noise / valence)')
+axes[1].set_ylabel('LSA Dim 2 (review density / WLB framing)')
+plt.colorbar(sc2, ax=axes[1], label='Overall rating (1–5)')
+
+plt.tight_layout()
+plt.show()
+```
+
+### 6.3 Synthesis: What the Two Perspectives Reveal Together
+
+The cross-tabulation and LSA Dim 1–2 scatter jointly establish three findings that neither similarity nor anomaly detection could have produced independently.
+
+**First**, the cross-tab shows that anomalous reviews are *modestly* more likely to have *low* firm-centroid similarity than normal reviews, the difference is **56.3% (anomalies) vs 50.0% (non-anomalies)** falling below the corpus median for firm-centroid similarity. The relationship is therefore real but small: linguistic unusualness corpus-wide and unusualness relative to one's own firm are correlated, but only weakly. This is itself informative: If Isolation Forest were merely re-detecting firm-specific vocabulary outliers, the gap would be much larger. The bulk of corpus-level anomalies are *not* employer-internal outliers.
+
+**Second**, **3,274 anomalous reviews (43.7% of all flagged reviews)** have *high* firm-centroid similarity. These are the **"clustered anomalies"**: reviews unusual relative to the 150,000-review working sample, yet *more* similar to their own firm's characteristic vocabulary than the median review at that firm. Read together with the first finding, the picture is striking: roughly two-fifths of what corpus-level anomaly detection flags as "unusual" is in fact entirely conventional inside the employer it came from. The firms producing the most clustered anomalies are systematically the highest-volume employers with the most idiosyncratic in-house vocabularies, led by **IBM (242), McDonald's (160), Microsoft (136), Deloitte (118), Oracle (114), PwC (100), EY (96), and J-P-Morgan (85)** (exact counts printed in cell output above; the §6.1 robustness cell confirms the firm ordering and the 43.5% headline are essentially identical on the deduplicated sample).
+
+The mechanism is interpretable. **IBM's** dominance reflects a deep stock of firm-internal project names, legacy systems, and acronyms (`pbc`, `stack ranking`, `band level`, internal product codenames) that recur in IBM reviews but appear nowhere else in the corpus, these terms also dominate the §8.4 declining-vocabulary list, confirming the same firm-vocabulary signal at term level. **McDonald's** dominance reflects the highly specific vocabulary of frontline quick-service work — shift terminology, crew-trainer / shift-manager language, store-number references, drive-thru-specific phrasing, that is entirely conventional inside McDonald's reviews but reads as off-distribution to a corpus-wide model dominated by white-collar tech and consulting language. **Microsoft and Oracle** show a milder version of the technology-firm effect (product-line names, internal org structure). The remainder of the list — **Deloitte, PwC, EY, J-P-Morgan** — is dominated by professional-services and investment-banking firms, whose reviews concentrate on engagement / client-billing vocabulary (`engagement`, `client`, `billing`, `staffing`, `workstream`, `senior associate`) that is internally cohesive but cross-industry distinctive.
+
+This is a **non-obvious analytical finding** that neither perspective produced alone: the similarity view by itself shows that some firms have unusually cohesive internal vocabularies (high within-firm similarity); the anomaly view by itself flags 7,500 individual reviews. Only the *intersection* reveals that a sizeable share of corpus-level anomalies are **firm-vocabulary anomalies** — they are not unusual reviews so much as reviews from firms whose entire vocabulary is unusual relative to the cross-industry corpus average. For a stakeholder briefing, this has a direct operational implication: corpus-wide anomaly detection should not be deployed as a fairness or fraud signal without firm-conditioning, because it will systematically over-flag employers with distinctive in-house vocabulary (manufacturing, retail, public-sector, hospitality) relative to white-collar firms whose vocabulary sits closer to the corpus mean.
+
+**Third**, the PCA plot reveals that rating (right panel) separates reviewers along the first principal component far more cleanly than anomaly score (left panel). Anomalous reviews are scattered across the PCA space, both positive-sentiment and negative-sentiment reviews can be linguistically anomalous, confirming that anomaly is orthogonal to valence. This is the sharpest distinction between the two perspectives: similarity captures shared sentiment patterns, while anomaly captures shared *structures* of linguistic deviation that are independent of whether the review is positive or negative.
+
+# Part B: Research Question
+
+## 7 Research Question and Stakeholder Relevance
+
+Part A established that similarity and anomaly detection can identify typical and exceptional patterns in individual review vocabulary, and that **rating tier is the primary driver of vocabulary structure** in the 200-dimensional LSA space (§3.5). Part B builds on this by asking a question that requires examining a second structural dimension: **time**.
+
+**Research question**: Did the COVID-19 pandemic (2020–2021) produce a measurable shift in the vocabulary and sentiment of Glassdoor reviews relative to the pre-pandemic period (2008–2019)? Specifically, which terms became significantly more or less frequent after 2019, and did the overall textual sentiment of reviews change direction, regardless of stated rating?
+
+This question matters for three groups of stakeholders. **Employees and job seekers** benefit from understanding whether pandemic-era reviews are systematically different in tone, so they can calibrate how to read recent employer ratings relative to historical ones. **HR professionals and employers** need to know whether the latent vocabulary of workplace experience shifted during COVID, as this would indicate that the dimensions employees care about changed, not just their satisfaction levels. **Labour economists and policymakers** are interested in whether workplace language reveals the emergence of new concerns, job security, remote work, healthcare, that were not salient before 2020 and may signal structural shifts in what employees expect from employers.
+
+### Reproducibility note for Part B
+
+Part B uses the **same source file** and the **same 150,000-review stratified sample** constructed in Part A; no second dataset is introduced. To rerun just this section, place `glassdoor_reviews.csv` in `data/` or the project root, then execute all preceding chunks in order.
+
+### Why Unsupervised Learning?
+
+The research question asks about the **latent structure** of vocabulary change over time, specifically what new topics emerged and how sentiment shifted, without pre-specifying which topics or terms are relevant. Supervised learning would require labelled categories of "COVID vocabulary" or "post-pandemic topics" defined in advance, which would circularly assume the answer. Unsupervised learning discovers the structure from the data itself.
+
+Furthermore, this analysis uses **two distinct unsupervised techniques** that address different aspects of the question. **BERTopic** (with HDBSCAN clustering as its core grouping algorithm) identifies latent topic clusters from semantically rich contextual embeddings, revealing what employees are talking about and how topic prevalence shifts across periods. **Log-ratio vocabulary analysis** directly quantifies which individual terms became more or less frequent post-COVID, providing a complementary word-level view that topic modelling can miss when shifts are distributed across many topics. Together they form a coherent two-technique pipeline: topic-level discovery (BERTopic + HDBSCAN) followed by term-level confirmation (log-ratio shift analysis).
+
+## 8 Methods
+
+### 8.1 BERTopic with HDBSCAN Clustering
+
+The Part B pipeline is a four-stage chain: **dense sentence embeddings → UMAP → HDBSCAN → c-TF-IDF**. Each stage solves a problem the previous cannot.
+
+- **Embeddings** (MiniLM, 384-dim): paraphrases land close together regardless of surface vocabulary — the property that makes topic discovery sensitive to genuine concerns rather than vocabulary forms. TF-IDF (Part A's representation) cannot do this; "no time outside of work" and "work–life balance was terrible" share no tokens.
+- **UMAP** (384 → 5-dim): HDBSCAN is density-based and degrades sharply above ~10 dimensions (curse of dimensionality on density estimation). UMAP preserves *local* neighbourhood structure (PCA preserves global variance; t-SNE is non-deterministic), the property HDBSCAN consumes.
+- **HDBSCAN**: handles variable-density clusters (k-means assumes spherical), explicitly leaves a noise label for between-topic reviews (k-means and LDA force every point into a cluster), and does not require k to be set in advance — the topic count is an output of the algorithm given a `min_cluster_size` floor.
+- **c-TF-IDF**: HDBSCAN delivers cluster IDs but not labels. Treating each cluster as a super-document and computing TF-IDF against the corpus of super-documents recovers the term-level interpretability dense embeddings discard.
+
+The model is fitted directly on all 150,000 reviews in the stratified working sample. UMAP scales approximately linearly in n once neighbours are indexed, and HDBSCAN operates on the 5-dim reduced representation rather than the full 384-dim embedding space, so fitting on the full sample is feasible and avoids any train/transform split.
+
+```{python}
+#| label: bertopic-fit
+
+# Encode all 150 k documents with sentence-transformers 
+all_docs = sample['combined'].tolist()
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+print(f"Encoding {len(all_docs):,} reviews with all-MiniLM-L6-v2 (384-dim)...")
+all_embeddings = embedder.encode(
+    all_docs, show_progress_bar=True, batch_size=256, normalize_embeddings=True
+)
+print(f"Embedding matrix shape: {all_embeddings.shape}")
+
+# BERTopic pipeline configuration 
+umap_cfg = UMAPModel(
+    n_neighbors=15, n_components=5,
+    min_dist=0.0, metric='cosine', random_state=42
+)
+hdbscan_cfg = HDBSCANModel(
+    min_cluster_size=200, min_samples=25,  # scaled up from 80/15 for 5× larger sample
+    metric='euclidean', cluster_selection_method='eom',
+    prediction_data=True
+)
+
+topic_model = BERTopic(
+    embedding_model=embedder,
+    umap_model=umap_cfg,
+    hdbscan_model=hdbscan_cfg,
+    top_n_words=10,
+    nr_topics='auto',
+    calculate_probabilities=False,
+    verbose=False
+)
+
+# Fit on the full 150 k sample directly 
+print("Fitting BERTopic (UMAP → HDBSCAN → c-TF-IDF) on full sample...")
+full_topics, _ = topic_model.fit_transform(all_docs, all_embeddings)
+sample['bertopic'] = full_topics
+
+n_topics  = len(set(full_topics)) - (1 if -1 in full_topics else 0)
+noise_pct = (np.array(full_topics) == -1).mean() * 100
+print(f"\nBERTopic fit complete: {n_topics} topics discovered on {len(sample):,} reviews")
+print(f"Noise fraction (reviews assigned topic -1): {noise_pct:.1f}%")
+print(f"\nTop 15 topics by size:")
+print(topic_model.get_topic_freq().head(15).to_string(index=False))
+```
+
+The BERTopic stack has three sub-models (sentence encoder, UMAP, HDBSCAN) plus the BERTopic wrapper itself, each with its own hyperparameters. The defaults shipped with the libraries are tuned for small (≈10²–10³ documents) corpora; this corpus is two orders of magnitude larger and the parameter values reflect that scaling. The table below states each chosen value, the typical small-corpus alternative, and the corpus-specific reason for the choice.
+
+**Sentence encoder**
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative |
+|---|---|---|---|
+| Model | **`all-MiniLM-L6-v2`** (384-dim) | `all-mpnet-base-v2` (768-dim) | MiniLM gives ≈95% of mpnet's semantic-similarity quality at one-fifth the inference cost. At n = 150,000 reviews, mpnet would take 4–5× longer to encode and produce a 2× larger embedding matrix that UMAP must then process. The marginal quality gain does not justify the cost on short, repetitive text. |
+| `batch_size` | **256** | 32–64 (default) | Glassdoor reviews are short (median ≈20 tokens); a 256-batch comfortably fits in 8 GB of GPU/Apple-Silicon memory and keeps the encoder GPU-bound rather than transfer-bound. Smaller batches under-utilise the device. |
+| `normalize_embeddings` | **True** | False (default) | Cosine similarity is the natural metric for sentence embeddings and is used downstream by UMAP (`metric='cosine'`). Pre-normalising at encode time removes the per-call normalisation cost and keeps the embedding matrix on the unit hypersphere. |
+| Input text | **preprocessed `combined`** | raw text | The standard guidance is to feed *raw* text to BERT-style encoders so contextual cues (case, punctuation, stop words) are preserved. Here the sample stratified text is short and the preprocessed version retains all content words; using the cleaned version keeps the c-TF-IDF topic labels (which use the same input) consistent with the embedding space and avoids the case where two reviews have identical preprocessed text but different raw forms producing different embeddings. |
+
+**UMAP (384 → 5 dimensions)**
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative |
+|---|---|---|---|
+| `n_neighbors` | **15** | 5 (default) for small corpora; 50 for very large ones | At n = 150,000, `n_neighbors=5` produces fragmented local manifolds — many tiny clusters with no global structure, inflating the noise rate. `n_neighbors=50` over-globalises and merges genuinely distinct topics. 15 is the sweet spot recommended by the UMAP documentation for n in the 10⁴–10⁵ range and is what BERTopic itself uses by default for medium-large corpora. |
+| `n_components` | **5** | 2 (visualisation default) | HDBSCAN performance degrades sharply above ~10 dimensions (curse of dimensionality on density estimation) but 2 dimensions is too compressed for 150,000 points across many topics — clusters overlap in projection. 5 retains enough topical resolution for HDBSCAN while staying inside the dimensionality where mutual-reachability distances are informative. |
+| `min_dist` | **0.0** | 0.1 (visualisation default) | `min_dist=0.0` packs points as tightly as possible within each local neighbourhood, which is what HDBSCAN needs to find dense regions. Higher values (0.1 default for visualisation) push points apart for human readability and would dissolve density structure that HDBSCAN relies on. |
+| `metric` | **`cosine`** | `euclidean` (default) | Sentence embeddings are L2-normalised, so cosine and euclidean are monotonically related on the unit hypersphere — but cosine is the metric the encoder was trained against and produces better-calibrated neighbourhood graphs for sentence-transformer outputs. |
+| `random_state` | **42** | unseeded | UMAP is stochastic; a fixed seed is required for reproducibility of topic assignments across re-runs of the report. |
+
+**HDBSCAN clustering**
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative |
+|---|---|---|---|
+| `min_cluster_size` | **200** | 4–15 (small-corpus tutorials) | At n = 150,000, `min_cluster_size=15` yields hundreds of micro-topics, most of which are firm-specific or vocabulary-specific accidents and cannot survive the pre-COVID (2008–19) vs COVID (2020–21) comparison in §8.4. 200 corresponds to roughly 0.13% of the corpus — large enough that any reported topic represents a genuine, recurrent workplace concern rather than a single firm's idiosyncrasy. |
+| `min_samples` | **25** | None (=`min_cluster_size`) | Setting `min_samples` lower than `min_cluster_size` makes HDBSCAN more permissive: clusters can form with denser cores while admitting more border points. With `min_samples=25` the algorithm finds the clusters at the conservative density threshold but does not over-classify their boundaries as noise — keeping the noise fraction below the ≈30% mark where the analysis becomes uninformative. |
+| `metric` | **`euclidean`** | `cosine` | UMAP has already projected the embeddings into a 5-dim Euclidean space designed for downstream Euclidean-distance methods. Asking HDBSCAN to use `cosine` after UMAP would re-introduce normalisation overhead and is not what the BERTopic pipeline is optimised for. |
+| `cluster_selection_method` | **`'eom'`** (Excess of Mass) | `'leaf'` | `'eom'` selects the most stable clusters at any density threshold — robust to the wide cluster-size distribution expected on a 150k corpus that mixes large generic topics ("compensation") with smaller specific ones ("graduate scheme"). `'leaf'` returns the finest-grained clusters, which would over-fragment the topic space and make period-comparison noisier. |
+| `prediction_data` | **True** | False | Required so that the c-TF-IDF representation can be reduced post-fit (BERTopic's `reduce_topics` and `transform` methods rely on it). Marginal memory cost. |
+
+**BERTopic wrapper**
+
+| Hyperparameter | Chosen | Common alternative | Why not the alternative |
+|---|---|---|---|
+| `nr_topics` | **`'auto'`** | a fixed integer (e.g. 20) | `'auto'` lets BERTopic merge similar topics post-hoc using c-TF-IDF cosine similarity, returning the number that the data supports rather than imposing a guess. Specifying a fixed `nr_topics` would force merges or splits regardless of the underlying density structure recovered by HDBSCAN — defeating the purpose of using a density-based clusterer. |
+| `top_n_words` | **10** | 5 (BERTopic default) | At n = 150,000 the c-TF-IDF representation has many discriminative terms per topic; truncating at 5 loses the long tail that distinguishes related topics (e.g. distinguishing "remote work" from "work from home" topics). 10 is the smallest `top_n_words` that produces visibly distinct topic labels in §8.2. |
+| `calculate_probabilities` | **False** | True | Computing full topic-probability vectors at n = 150,000 over ≈40 topics produces a dense `(150 000, 40)` matrix and adds substantial memory pressure for no analytical gain in §8.4 (the period-shift comparison uses hard topic assignments, not soft probabilities). Switched off for compute. |
+
+These choices together produce the topic discovery pipeline used in §8.2–§8.4. The interaction between UMAP and HDBSCAN parameters (in particular `n_components=5` and `min_cluster_size=200`) is the load-bearing pair: most of the deviation from small-corpus defaults sits there, and the noise fraction printed by the fit cell is the diagnostic the calibration is verified against.
+
+### 8.2 HDBSCAN Cluster Analysis
+
+With topic assignments from BERTopic available for all 150,000 reviews, we now characterise the HDBSCAN clustering geometry directly: cluster sizes, period composition, and which topics are disproportionately COVID-era.
+
+```{python}
+#| label: hdbscan-analysis
+
+# ── Cluster-size distribution (non-noise topics only) ─────────────────────────
+topic_freq = topic_model.get_topic_freq()
+non_noise   = topic_freq[topic_freq['Topic'] >= 0].copy()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left: histogram of cluster sizes
+n_hist, _, patches_hist = axes[0].hist(non_noise['Count'], bins=30, color='#4C9BE8', edgecolor='white')
+axes[0].set_xlabel('Cluster size (number of reviews)', fontsize=11)
+axes[0].set_ylabel('Number of clusters', fontsize=11)
+axes[0].set_title('Cluster sizes follow a long-tail distribution —\na few large topics, many small niche ones', fontsize=12, fontweight='bold')
+axes[0].grid(alpha=0.3)
+for b in patches_hist:
+    h = b.get_height()
+    if h > 0:
+        axes[0].text(b.get_x() + b.get_width()/2, h,
+                     f'{int(h)}', ha='center', va='bottom', fontsize=8)
+axes[0].set_ylim(0, axes[0].get_ylim()[1] * 1.10)
+
+# Right: top-20 topics by review count
+top20 = non_noise.head(20).sort_values('Count')
+bars_top = axes[1].barh(range(len(top20)), top20['Count'], color='#E87A4C', alpha=0.8)
+axes[1].set_yticks(range(len(top20)))
+axes[1].set_yticklabels([f"T{int(t)}" for t in top20['Topic']], fontsize=9)
+axes[1].set_xlabel('Number of reviews', fontsize=11)
+axes[1].set_title('A few topics absorb the bulk of clustered reviews —\nthe largest holds ~8,000 of 71 clusters', fontsize=12, fontweight='bold')
+axes[1].grid(axis='x', alpha=0.3)
+for b in bars_top:
+    w = b.get_width()
+    axes[1].text(w, b.get_y() + b.get_height()/2,
+                 f' {int(w):,}', ha='left', va='center', fontsize=8)
+axes[1].set_xlim(0, axes[1].get_xlim()[1] * 1.12)
+
+plt.tight_layout()
+plt.show()
+
+print(f"Total non-noise clusters: {len(non_noise)}")
+print(f"Median cluster size: {non_noise['Count'].median():.0f}")
+print(f"Largest cluster: {non_noise['Count'].max():,} reviews (Topic {non_noise.loc[non_noise['Count'].idxmax(), 'Topic']})")
+
+# ── Noise rate by period (full sample, since fit on all 150 k) ───────────────
+noise_by_period = sample.groupby('period', observed=True).apply(
+    lambda g: (g['bertopic'] == -1).mean() * 100
+).reset_index(name='noise_pct')
+print("\nNoise rate by period (full sample):")
+print(noise_by_period.to_string(index=False))
+```
+
+**Interpretation.** The fit yields **71 non-noise clusters** with a median size of **536 reviews** and a long-tailed size distribution: the largest cluster (T0) absorbs **7,945 reviews** — roughly 5.3% of the corpus and ≈15× the median — while the bottom half of clusters each hold a few hundred reviews. This is exactly the geometry HDBSCAN with `min_cluster_size=200` is calibrated to recover: a small head of broad topics (work–life balance, pay, management, the generic "con/pro" template) plus a long tail of niche topics that smaller `min_cluster_size` thresholds would shatter into noise.
+
+The noise rates by period are also informative: **COVID 51.2%**, **Mature 57.3%**, **Early 61.8%**. Two readings. First, *all three rates are high in absolute terms*, which is a known property of HDBSCAN on short-text embeddings — points in low-density regions of the UMAP space are pushed to the −1 noise bucket rather than force-assigned to the nearest cluster (in contrast to k-means or LDA). The 51–62% noise band is consistent with the lecture's observation that BERTopic on short reviews routinely leaves a majority of points unclustered, and is *informative* rather than a failure mode: the modelled clusters are the dense, semantically-coherent attractors, not an exhaustive partition. Second, the noise rate is **monotonically lower in COVID than in earlier periods** (51.2% < 57.3% < 61.8%). The COVID slice is the *densest* in topic space — pandemic-era reviews concentrate in fewer, higher-density semantic neighbourhoods (remote-work, safety, furlough, DEI), while the earlier eras are more diffuse and idiosyncratic. This already foreshadows the §8.3 finding that a small number of topics absorb a disproportionate share of COVID-era writing.
+
+### 8.3 Topic Period Analysis: COVID Excess
+
+For each BERTopic topic, we calculate the **COVID excess**: the percentage of that topic's reviews that fall in the COVID period (2020–2021), minus the corpus-wide COVID share. A positive excess means the topic is disproportionately COVID-era; a negative excess means it declined post-2019.
+
+```{python}
+#| label: topic-period-analysis
+
+periods_ord = ['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']
+sample_valid = sample[sample['bertopic'] >= 0].copy()
+
+# Period composition per topic (normalised to 100%)
+topic_period_pct = (
+    pd.crosstab(sample_valid['bertopic'], sample_valid['period'],
+                normalize='index') * 100
+).reindex(columns=periods_ord, fill_value=0)
+
+# Corpus-level COVID share
+expected_covid_pct = (sample['period'] == 'COVID (2020–21)').mean() * 100
+topic_period_pct['covid_excess'] = (
+    topic_period_pct['COVID (2020–21)'] - expected_covid_pct
+)
+
+# ── Top COVID-enriched and COVID-depleted topics ──────────────────────────────
+top_covid   = topic_period_pct.nlargest(10, 'covid_excess')
+top_decline = topic_period_pct.nsmallest(10, 'covid_excess')
+
+print(f"Corpus-wide COVID period share: {expected_covid_pct:.1f}%\n")
+print("── Topics most enriched in COVID period ──")
+for tid in top_covid.index:
+    excess = top_covid.loc[tid, 'covid_excess']
+    words  = topic_model.get_topic(int(tid))
+    top_w  = ', '.join([w for w, _ in words[:6]])
+    print(f"  T{tid:>3d}  excess={excess:+.1f}pp  top-terms: {top_w}")
+
+print("\n── Topics most depleted in COVID period ──")
+for tid in top_decline.index:
+    excess = top_decline.loc[tid, 'covid_excess']
+    words  = topic_model.get_topic(int(tid))
+    top_w  = ', '.join([w for w, _ in words[:6]])
+    print(f"  T{tid:>3d}  excess={excess:+.1f}pp  top-terms: {top_w}")
+
+# ── Stacked bar chart: period composition for top-15 topics ──────────────────
+top15_ids = topic_model.get_topic_freq().head(15)['Topic'].tolist()
+top15_ids = [t for t in top15_ids if t >= 0]
+
+plot_df = topic_period_pct.loc[topic_period_pct.index.isin(top15_ids), periods_ord].copy()
+plot_df.index = [f"T{t}" for t in plot_df.index]
+plot_df = plot_df.sort_values('COVID (2020–21)', ascending=True)
+
+colors = ['#78909c', '#1565c0', '#c62828']
+ax = plot_df.plot(kind='barh', stacked=True, figsize=(12, 6),
+                  color=colors, alpha=0.85, width=0.75)
+ax.axvline(expected_covid_pct, color='red', linestyle='--', linewidth=1.2,
+           label=f'Expected COVID share ({expected_covid_pct:.1f}%)')
+ax.set_xlabel('% of topic reviews in each period', fontsize=11)
+ax.set_ylabel('BERTopic topic', fontsize=11)
+ax.set_title('Top-15 high-frequency topics split roughly along the corpus baseline —\ntemporal signal lives in the long tail, not the head',
+             fontsize=12, fontweight='bold')
+ax.legend(loc='lower right', fontsize=9)
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation.** The corpus-wide COVID share is **34.0%**, so any topic whose COVID share exceeds 34.0% by a meaningful margin is disproportionately pandemic-era. Three patterns emerge from the actual output.
+
+*Direct pandemic topic.* **T60** (`covid, pandemic, care, support, virus, employee`) tops the enriched list at **+65.2pp** excess — i.e. ≈99% of T60 reviews fall in the 2020–21 slice. This topic is essentially a clean detector of pandemic-specific writing: it could not have existed before 2020 and validates that BERTopic recovers semantically novel structure rather than just re-shuffling pre-existing themes.
+
+*Operationally COVID-shaped topics.* Below T60, the next genuinely interpretable enriched topics are **T13** (`diversity, inclusion, inclusive, diverse, culture, opportunity`, **+16.9pp**) — the well-documented post-2020 surge in DEI discourse following the 2020 social-justice movements that overlapped with the pandemic — and **T20** (`shift, night, pattern, flexible, hour, pay`, **+16.9pp**) and **T44** (`overtime, pay, available, hour, lot, work`, **+15.8pp**), which together register the shift-pattern / overtime / flexible-scheduling vocabulary that became salient as essential-worker rotas and remote schedules were renegotiated. **T30** (`learning, learn, hour, long, curve, lot`, **+15.8pp**) plausibly reflects the steep ramp of new-process learning during the remote transition. Note that **T34** (`bad, love, good, think, okay, awesome`, **+34.2pp**) and **T11** (`con, company, pro, good, great, work`, **+18.2pp**) are *not* substantively COVID topics — they are c-TF-IDF placeholder clusters dominated by generic sentiment / template tokens (`pro`, `con`) and should be read as artefactual.
+
+*Depleted topics — what dropped.* The depleted list is dominated by two groups. **(a) Firm-specific topics**: T49 Microsoft (−21.4pp), T31 Apple retail (−19.3pp), T27 Oracle (−17.7pp), T8 IBM (−15.3pp), T56 PwC (−11.2pp), T22 banking (−11.7pp), T14 hotels/Hilton/Marriott (−10.3pp). These are not "concerns that disappeared" but composition-shift artefacts: the COVID-era sample contains fewer reviews of these specific employers as a share of corpus, so their dedicated topics are mechanically depleted. **(b) Physically-suspended activities**: **T40** internships (`intern, internship, summer, program`, **−22.3pp**) — internship programmes were widely paused or cancelled in 2020; **T45** office perks (`gym, membership, free, site, facility, cafeteria`, **−11.0pp**) — on-site amenities were inaccessible during lockdown; **T68** healthcare benefits (`dental, medical, vision, health, insurance`, **−12.3pp**) declined slightly as remote work shifted attention away from in-office benefit packages. These are the substantively interpretable depletions and align tightly with what the qualitative narrative would predict.
+
+*Top-15 stacked bar.* The dominant high-frequency topics (work–life balance, pay, management, career growth) split across periods in line with the 34% COVID baseline, i.e. the *bulk* of workplace discourse is temporally stable. The temporal signal lives in the long tail surfaced by the enriched/depleted cuts above, not in the top-15 head — consistent with the §3.5 finding that period explains far less variance than rating in the static LSA space.
+
+### 8.4 Term-Level Vocabulary Shift (Log-Ratio Analysis)
+
+BERTopic identifies topic-level shifts, but individual terms may shift in frequency across topics. The log-ratio analysis quantifies which specific terms became significantly more or less frequent in the COVID period compared to the pre-pandemic baseline.
+
+```{python}
+#| label: period-vocab-shift
+
+# ── Compute term frequencies in pre-COVID vs COVID periods ────────────────────
+pre_mask  = sample['period'].isin(['Early (2008–15)', 'Mature (2016–19)'])
+post_mask = sample['period'] == 'COVID (2020–21)'
+
+# Fit a CountVectorizer on the combined field with the same parameters as the
+# TF-IDF step (§3.3) so term definitions are consistent across both analyses
+count_cv = CountVectorizer(min_df=5, max_df=0.85, max_features=15_000,
+                           ngram_range=(1, 2))
+count_cv.fit(sample['combined'])
+
+X_pre  = count_cv.transform(sample.loc[pre_mask,  'combined'])
+X_post = count_cv.transform(sample.loc[post_mask, 'combined'])
+
+# Normalise to per-document frequency to correct for unequal group sizes
+n_pre  = pre_mask.sum()
+n_post = post_mask.sum()
+
+freq_pre  = np.asarray(X_pre.sum(axis=0)).ravel() / n_pre
+freq_post = np.asarray(X_post.sum(axis=0)).ravel() / n_post
+
+eps = 1e-8   # numerical-stability floor to avoid log(0); not Laplace +1
+log2_ratio = np.log2((freq_post + eps) / (freq_pre + eps))
+
+vocab_list = count_cv.get_feature_names_out()
+vocab_shift = pd.DataFrame({
+    'term':       vocab_list,
+    'freq_pre':   freq_pre,
+    'freq_post':  freq_post,
+    'log2_ratio': log2_ratio,
+}).sort_values('log2_ratio', ascending=False)
+
+# Apply minimum frequency filter to exclude very rare terms
+MIN_FREQ = 1e-4
+vocab_shift = vocab_shift[
+    (vocab_shift['freq_pre'] > MIN_FREQ) | (vocab_shift['freq_post'] > MIN_FREQ)
+].copy()
+
+# ── Print top rising and declining terms ──────────────────────────────────────
+print("Terms with LARGEST increase post-COVID (log₂ ratio, rising):")
+print(vocab_shift.head(20)[['term', 'freq_pre', 'freq_post', 'log2_ratio']].to_string(index=False))
+
+print("\nTerms with LARGEST decrease post-COVID (log₂ ratio, declining):")
+print(vocab_shift.tail(20).sort_values('log2_ratio')[['term', 'freq_pre', 'freq_post', 'log2_ratio']].to_string(index=False))
+
+# ── Check hypothesised COVID terms ────────────────────────────────────────────
+hypothesised = ['remote', 'wfh', 'home', 'insurance', 'healthcare', 'furlough',
+                'redundancy', 'secure', 'security', 'wage', 'flexible', 'burnout']
+found = vocab_shift[vocab_shift['term'].isin(hypothesised)].sort_values('log2_ratio', ascending=False)
+print("\nHypothesised COVID-era terms:")
+print(found[['term', 'freq_pre', 'freq_post', 'log2_ratio']].to_string(index=False))
+
+# ── Bar chart: top-20 rising and top-20 declining terms ──────────────────────
+top_rising   = vocab_shift.head(20)
+top_declining = vocab_shift.tail(20).sort_values('log2_ratio')
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
+
+bars_rise = axes[0].barh(top_rising['term'], top_rising['log2_ratio'],
+             color='#c62828', alpha=0.85)
+axes[0].set_xlabel('log₂(freq_post / freq_pre)', fontsize=11)
+axes[0].set_title('Top 20 terms rising post-COVID', fontsize=12, fontweight='bold')
+axes[0].axvline(0, color='black', linewidth=0.8)
+axes[0].grid(axis='x', alpha=0.3)
+for b in bars_rise:
+    w = b.get_width()
+    axes[0].text(w, b.get_y() + b.get_height()/2,
+                 f' {w:+.2f}', ha='left', va='center', fontsize=8)
+axes[0].set_xlim(0, axes[0].get_xlim()[1] * 1.15)
+
+bars_dec = axes[1].barh(top_declining['term'], top_declining['log2_ratio'],
+             color='#1565c0', alpha=0.85)
+axes[1].set_xlabel('log₂(freq_post / freq_pre)', fontsize=11)
+axes[1].set_title('Top 20 terms declining post-COVID', fontsize=12, fontweight='bold')
+axes[1].axvline(0, color='black', linewidth=0.8)
+axes[1].grid(axis='x', alpha=0.3)
+for b in bars_dec:
+    w = b.get_width()
+    axes[1].text(w, b.get_y() + b.get_height()/2,
+                 f'{w:+.2f} ', ha='right', va='center', fontsize=8)
+axes[1].set_xlim(axes[1].get_xlim()[0] * 1.15, 0)
+
+fig.suptitle('COVID introduces a small set of new tokens (covid, pandemic, lockdown, furlough); declines are dominated by firm-specific idioms',
+             fontsize=13, fontweight='bold')
+plt.show()
+```
+
+**Interpretation.** The log-ratio output partitions cleanly into four substantive groups.
+
+*(i) Pandemic-defining vocabulary that did not exist before 2020.* The top of the rising list is dominated by terms with `freq_pre ≈ 0` and therefore log₂ ratios near the ε-floor: **covid** (log₂ ≈ +20.0), **pandemic** (+19.4), **pre covid** (+16.1), **coronavirus** (+15.7), **corona** (+15.6), **lockdown** (+6.8). These are not "rising" in the gradual sense — they are essentially new tokens introduced into workplace discourse by the pandemic, and their appearance is the term-level analogue of the BERTopic T60 finding in §8.3.
+
+*(ii) Genuine post-2020 themes that pre-existed but became more salient.* Below the pandemic-specific tokens, the rising list isolates substantive shifts in workplace concern: **wlb / good wlb** (log₂ ≈ +2.95 / +3.01), **furlough** (+2.80), and the diversity-and-inclusion bigrams **diversity inclusion** (+1.84), **inclusion diversity** (+2.23), **diverse inclusive** (+2.00). The rise of *wlb* as a written abbreviation rather than a spelled-out phrase, alongside *furlough* (a UK-specific labour-market term), are the clearest signs that COVID-era reviews internalised a new shared vocabulary about how work is bounded. The diversity-inclusion bigrams quantitatively confirm the qualitative observation about T13 in §8.3. **culture toxic** (+1.80) is also notable — a small but real rise in the explicit naming of toxic culture as an employee complaint.
+
+*(iii) Hypothesised COVID terms — partial confirmation.* Of the twelve hypothesised tokens, only **furlough** (+2.80), **wfh** (+1.14), **burnout** (+0.49), and **remote** (+0.33) rose. **redundancy** is essentially flat (−0.02). The remaining hypothesised terms — **flexible** (−0.11), **security** (−0.23), **wage** (−0.34), **secure** (−0.61), **insurance** (−0.73), **healthcare** (−0.75), **home** (−0.85) — *fell*. The fall in **home** alongside the rise in **wfh** and **remote** is the most informative pattern: it suggests reviewers replaced the generic, polysemous token "home" with the more specific "wfh"/"remote" labels once remote work became the default mode rather than an ad-hoc arrangement. The decline of **insurance** and **healthcare** is consistent with the §8.3 depletion of T68 (dental/medical/vision benefits), and likely reflects a sample-composition shift toward employers and roles that write less about benefit packages, rather than a substantive de-prioritisation of healthcare during a pandemic.
+
+*(iv) Declining terms reveal sample composition, not topic decline.* The declining list is dominated by **firm-specific tokens** that no longer appear in the COVID slice at all: **stack ranking** and **pbc** (the IBM-internal "Personal Business Commitments" performance system, both at log₂ ≈ −15.7), **apple retail**, **mcgladrey**, **citibank**, **financial advisor**. These are not concerns that vanished — they are firm-specific idioms whose reviews fell out of the COVID stratum, mirroring the T49/T31/T27/T8/T22 depletions in §8.3. The remaining declining terms (`viable`, `pinch`, `radar`, `inside outside`, `tale`) are low-frequency generic vocabulary whose disappearance is statistically dominated by the ε-floor in the log argument rather than substantively meaningful.
+
+*Synthesis.* Read together, §8.3 (topic-level) and §8.4 (term-level) tell a single story: COVID introduced a small set of genuinely new tokens (covid, pandemic, lockdown, furlough), promoted a pre-existing vocabulary about boundaries and well-being (wlb, wfh, remote, burnout, diversity-inclusion bigrams, "culture toxic"), and shifted *which* employers were being reviewed (away from large-tech and consulting firms whose firm-specific idioms dominate the declining list). The temporal signal lives in roughly 20–30 mid-frequency terms and 8–10 mid-frequency topics — small in absolute count but interpretively coherent.
+
+### 8.5 Sentiment Shift by Period
+
+The log-ratio analysis measures *what* employees write about; this cell measures *how positively or negatively* they write it, using the text_valence signal already computed in §5.2.
+
+```{python}
+#| label: period-sentiment-shift
+
+# text_valence already computed in §5.2 (sim to 5-star centroid minus sim to 1-star centroid)
+# overall_rating is on 1–5 scale
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Panel A: violin plot of text_valence by period
+period_order = ['Early (2008–15)', 'Mature (2016–19)', 'COVID (2020–21)']
+palette = {'Early (2008–15)': '#78909c', 'Mature (2016–19)': '#1565c0', 'COVID (2020–21)': '#c62828'}
+
+sns.violinplot(
+    data=sample, x='period', y='text_valence',
+    order=period_order, palette=palette,
+    inner='quartile', ax=axes[0], density_norm='width'
+)
+axes[0].axhline(3, color='black', linestyle='--', linewidth=0.8, alpha=0.5, label='Neutral valence (=3)')
+axes[0].set_xlabel('Temporal period', fontsize=11)
+axes[0].set_ylabel('Text valence (LSA-derived, 1–5 scale)', fontsize=11)
+axes[0].set_title('Text valence is positively skewed in every period —\ntemporal shift in the means is small relative to within-period spread', fontsize=12, fontweight='bold')
+axes[0].legend(fontsize=9)
+axes[0].grid(axis='y', alpha=0.3)
+
+# Panel B: mean overall_rating and mean text_valence per period
+summary = sample.groupby('period', observed=True).agg(
+    mean_rating=('overall_rating', 'mean'),
+    mean_text_valence=('text_valence', 'mean'),
+    n=('overall_rating', 'count')
+).reindex(period_order)
+
+x = np.arange(len(period_order))
+width = 0.35
+# Both signals already live on the 1–5 scale (text_valence rescaled in §5.2),
+# so plot them directly in their native units rather than re-normalising.
+bars1 = axes[1].bar(x - width/2, summary['mean_rating'],
+                    width, color='#388e3c', alpha=0.85, label='Mean overall_rating')
+bars2 = axes[1].bar(x + width/2, summary['mean_text_valence'],
+                    width, color='#c62828', alpha=0.85, label='Mean text valence')
+
+# Annotate exact values on each bar so small period-to-period shifts are legible
+for b in list(bars1) + list(bars2):
+    axes[1].text(b.get_x() + b.get_width()/2, b.get_height() + 0.03,
+                 f'{b.get_height():.2f}', ha='center', va='bottom', fontsize=9)
+
+axes[1].axhline(3, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(period_order, rotation=15, ha='right', fontsize=10)
+axes[1].set_ylabel('Score (1–5 scale)', fontsize=11)
+axes[1].set_title('Rating and text valence move together across periods —\nthe COVID signal is compositional, not a sentiment shift',
+                  fontsize=12, fontweight='bold')
+axes[1].legend(fontsize=9, loc='lower right')
+axes[1].grid(axis='y', alpha=0.3)
+axes[1].set_ylim(1, 5)
+
+plt.tight_layout()
+plt.show()
+
+print("Summary statistics by period:")
+print(summary[['mean_rating', 'mean_text_valence', 'n']].to_string())
+```
+
+**Interpretation.** The violin plot (Panel A) shows the full *distribution* of LSA-derived text valence within each period, while the bar chart (Panel B) shows the period means for both signals on their native 1–5 scale. Two patterns matter.
+
+First, the bulk of the violins is centred well above the dashed neutral line at 3 in every period — Glassdoor reviews are positively skewed on average regardless of when they were written, consistent with the well-documented self-selection of who chooses to leave a public review. The tails are heavy on the negative side rather than symmetric, which is what produces the §5.2 *rating–text divergence* anomalies: a sub-population whose vocabulary places them firmly in the lower half of the valence distribution despite a high overall_rating.
+
+Second, both signals trend modestly upward across periods (Early 3.43 → COVID 3.84 in rating, 3.61 → 4.02 in valence), reflecting the platform's overall maturation rather than a pandemic-specific sentiment shift, the rises are gradual and pre-COVID, not a step at 2020. The period-to-period shift in the *means* is small relative to within-period spread (within-period std ≈ 1.3 on the 1–5 scale, so the 0.4-point Early→COVID rise is roughly 0.3 SD). Crucially the two signals move *together* (both rising or both falling across periods), confirming that text valence tracks the rating signal it was constructed from rather than diverging from it at the aggregate level. The substantive content of the temporal shift therefore is *not* "COVID reviews became more negative on average" — that would have shown up as a downward step in both bars. It is the compositional shift documented in §8.3 (which topics are written about) and §8.4 (which terms are used), against a roughly stable baseline of overall positivity. This is consistent with the framing in §3.5: rating dominates the static LSA space, so a sentiment-only view of temporal change is uninformative; topic and vocabulary shifts are where the COVID signal lives.
+
+## 9 Answering the Research Question
+
+The detailed findings have been developed inline in §§8.2–8.5. What remains is the direct answer and the stakeholder briefing.
+
+**Did COVID produce a measurable shift in workplace vocabulary?** Yes — but the shift is *compositional*, not a change in tone. The pandemic introduced a small set of genuinely new tokens (covid, pandemic, lockdown, furlough — §8.4), promoted a pre-existing vocabulary about boundaries and well-being (wlb, wfh, remote, burnout, "culture toxic", DEI bigrams), and re-weighted topic prevalence (T60 +65pp, T13 +17pp, T20 +17pp; T40 internships −22pp; firm-specific topics depleted). Mean rating and mean text valence move in lockstep across periods (Early 3.43 → COVID 3.84 in rating; 3.61 → 4.02 in valence), so the COVID signal lives in *which* concerns are written about, not in *how positively* employees write overall.
+
+The three stakeholder implications follow directly:
+
+**For employees and job-seekers.** Post-2019 ratings are not systematically inflated or deflated relative to pre-pandemic ratings — the upward trend in mean rating is gradual and pre-COVID, consistent with platform maturation rather than a 2020 step-change. *Operational implication:* a 4★ post-2020 rating is comparable to a 4★ pre-2020 rating in numerical terms, but the *content* of the review will emphasise different dimensions (remote-work logistics, well-being, DEI). A like-for-like *text* comparison across periods is misleading; a like-for-like *rating* comparison is not.
+
+**For HR and employer-brand teams.** The rise of wlb, wfh, "culture toxic", and the diversity–inclusion bigrams indicates that the dimensions employees actively name in writing have permanently shifted toward boundaries, well-being, and inclusion. *Operational implication:* employee-experience benchmarking instruments built on pre-2020 category schemas (compensation, career growth, management) will under-detect what current candidates value. Topic categories in any survey or sentiment-tracking pipeline need refresh against the post-2020 vocabulary surfaced in §8.4 — particularly the wlb / wfh / burnout cluster and the DEI bigrams, which together account for the bulk of the genuine (non-pandemic-specific) rise.
+
+**For labour economists and platform researchers.** The depletion of firm-specific idioms (IBM `pbc` / `stack ranking`, Apple retail, McGladrey, Citibank) is the most important methodological warning. *Operational implication:* the COVID period is not a representative time-slice of the same employer panel — it is a different sample of employers as well as a different time. Any temporal claim about "what changed during COVID" using uncorrected employer-review corpora will conflate genuine pandemic effects with which firms continued generating reviews. The §10.1 firm-fixed-effects log-ratio (within-firm comparison restricted to firms active in both periods) is the minimum fix; treating the corpus as a fixed-population panel is the modal failure mode of this kind of study.
+
+## 10 Limitations, Ethical Considerations, and Why Unsupervised Learning
+
+### 10.1 Limitations
+
+The following limitations are specific to this analysis and go beyond the generic caveat that "more data would help."
+
+Each limitation below is paired with a specific, grounded extension that would directly address it — not generic suggestions.
+
+**1. Stratified sample does not correct for temporal imbalance.** The 15-strata proportional sampling design (3 periods × 5 rating tiers) corrects for rating skew but over-represents recent reviews relative to their corpus share, because the COVID period (2020–2021) is only 2 years but contains a disproportionate share of the corpus due to Glassdoor's growth. The similarity, anomaly, and BERTopic analyses are therefore conducted on a temporally recency-weighted sample. Findings about period differences should be interpreted as differences conditional on this weighting.
+  *Extension:* move to a **period × rating joint stratification** (15 equally-sized cells of ≈10,000 reviews each). The smallest cell (early-phase 1★) contains over 6,000 reviews, so this is feasible without synthetic oversampling. Re-running §8's BERTopic fit on the balanced sample would directly test whether the "COVID vocabulary shift" finding in §8.4 survives when recency weighting is removed.
+
+**2. BERTopic's noise category can mask topic structure.** HDBSCAN assigns a noise label (topic −1) to reviews that do not belong to any dense cluster. In short-text corpora, noise fractions of 20–35% are common. Reviews in the noise category are heterogeneous and may contain vocabulary shifts that BERTopic cannot detect because they are distributed across many diverse documents rather than concentrated in a coherent cluster. The log-ratio analysis in §8.4 partially compensates for this by examining all terms regardless of topic assignment.
+  *Extension:* run a **second-pass HDBSCAN with lower `min_cluster_size`** (e.g. 50 instead of 200) restricted to the noise documents only. This would reveal whether the noise bucket contains genuine small niche topics (industry-specific jargon, non-English fragments) or true outlier vocabulary. Comparing the period composition of these recovered sub-topics against the main topics would confirm whether §8.4's COVID shift extends to the noise bucket.
+
+**3. The all-MiniLM-L6-v2 embedding model was not trained on workplace reviews.** Sentence transformer embeddings reflect the semantic structure of their training corpus (primarily web text and news). Domain-specific jargon, firm names (IBM, McDonald's), and industry-specific abbreviations may be poorly represented in the embedding space, causing BERTopic to either under-cluster industry-specific topics or merge them with topically distinct clusters that happen to share generic vocabulary.
+  *Extension:* **domain-adapt MiniLM on the Glassdoor corpus** via masked-language-model continued pre-training on the 838k reviews, then re-embed the 150k sample. The expected gain is most measurable in cluster coherence (c_v topic coherence score): if MiniLM is under-clustering industry-specific topics, a domain-adapted model should produce higher c_v on the same HDBSCAN settings. A controlled comparison between vanilla-MiniLM and adapted-MiniLM topic sets on the same 150k sample would quantify the gain.
+
+**4. Log-ratio analysis is confounded by sample composition.** The COVID period (2020–2021) has a different firm composition than earlier periods: firms that closed or reduced operations during the pandemic contributed fewer reviews, while firms that expanded (logistics, e-commerce, healthcare) contributed more. A rising term in the COVID period may therefore reflect a changed firm mix rather than a genuine vocabulary shift within firms.
+  *Extension:* a **firm-fixed-effects log-ratio**: restrict the comparison to the subset of firms that contributed reviews in *both* the pre-COVID and COVID periods, and compute log-ratios within each firm before aggregating across firms. This isolates genuine within-firm vocabulary shift from firm-mix churn. Terms whose rise survives this stricter test are the ones that can be confidently attributed to the pandemic rather than to which firms stayed active.
+
+**5. Text length confounds cosine similarity.** A 5-word review and a 200-word review covering the same themes will score a lower cosine similarity than two 5-word reviews using identical words, even though the longer review contains substantially more information. The LSA normalisation mitigates this partially, but it does not eliminate the length-similarity confound, which may artificially lower similarity scores for very short reviews.
+  *Extension:* **length-stratified similarity analysis** — bin reviews into length quartiles and compute within-firm similarity only between reviews in the same length bin. If the firm-level similarity ranking from §4 is stable across length quartiles, the length confound is benign; if the ranking changes meaningfully, §4's conclusions would need to be qualified as partly length-driven.
+
+### 10.2 Ethical Considerations
+
+**Potential for employee de-anonymisation.** Glassdoor reviews are submitted with the expectation of employer-level anonymity but not corpus-level anonymity. Displaying specific anomalous reviews alongside firm names, as done in §5.3, creates a theoretical risk of de-anonymisation for employees in specialist roles at smaller firms, where a distinctive set of vocabulary might correspond to only one or two individuals. In this academic context, text excerpts are displayed purely for analytical illustration. Any operational deployment of this analysis should aggregate sufficiently across employees and implement review-level masking before publication.
+
+**Selection bias in the reviewer population.** Employees who take the time to write a Glassdoor review are not a random sample of the workforce. Research consistently shows that review platforms exhibit J-curve sentiment distributions, reviewers are disproportionately those with very strong positive or very strong negative experiences. This means that our findings about "typical" workplace narratives may systematically underrepresent the modal employee experience of moderate satisfaction, and our anomaly detection may flag as unusual reviews that would be unremarkable in an unbiased sample.
+
+**Risk of findings being misused.** The research question is framed to support better-informed decision-making by job seekers and policymakers. However, the same findings could be used by employers to identify which vocabulary patterns correlate with low ratings and to coach employees away from using such vocabulary in reviews, effectively manipulating the platform's signal. Similarly, the anomaly detection methodology could be used by platforms to suppress or down-weight reviews that are flagged as linguistically unusual, disproportionately affecting reviews from employees who write in non-standard English or who are non-native speakers.
+
+**Linguistic anomaly ≠ experiential inaccuracy.** A review flagged as anomalous because it contains non-English phrases or highly technical vocabulary is not less accurate or less valuable than a standard review; it is simply less common. Any operational use of anomaly scores to filter or weight reviews would introduce a systematic bias against reviews from linguistically diverse or technically specialised employees.
+
+### 10.3 Why Unsupervised Learning Is the Right Choice
+
+Supervised learning would require pre-defining the categories of vocabulary change — but the research question is precisely about *discovering* those categories. A classifier trained on `pre-COVID vs COVID` would answer "are they different?" (trivially yes, by time label), not "what is different and why?". The two unsupervised methods used here partition the work: BERTopic discovers topic-level structure; log-ratio confirms it at term level. Neither relies on a pre-specified outcome, so both are free to surface patterns the analyst did not anticipate (T60 covid-care, the wlb / wfh / DEI bigram cluster, the firm-specific decline list).
+
+### 10.4 Thresholds and Choices Throughout the Pipeline
+
+At every step of this analysis a small number of thresholds and modelling choices shape what the results look like. None of them are forced by the data — each is a trade-off between sensitivity and stability, between resolution and noise, or between coverage and computation. The table below makes those choices explicit, gives the alternatives that were considered, and points to the section where the choice is justified. Different choices would produce different results — this does not make the analysis arbitrary; it means that all quantitative text analysis is model-dependent, and reporting sensitivity to key decisions is part of responsible methodology.
+
+**Sampling and corpus design**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| Working sample size | 150,000 reviews (≈18% of corpus) | 50k, 100k, 200k | §3.1 (sensitivity + robustness cells) |
+| Stratification design | period × rating (15 strata, proportional) | rating-only (5 strata); firm-stratified | §3.1 |
+| Temporal period boundaries | 2008–2015 / 2016–2019 / 2020–2021 | 2-period (pre-/post-2020); year-by-year | §1.3 |
+| Period split (Part B) | pre-COVID (2008–2019) vs COVID (2020–2021) | 2019 vs 2020 (single-year hard break); pre-2020 vs 2020+ | §8.3 |
+
+**Text preprocessing**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| Stopwords | spaCy default + 22 domain terms | sklearn English list; no stopword removal | §3.2 |
+| Lemmatisation | spaCy `en_core_web_sm` | Porter stemmer; no normalisation | §3.2 |
+| Pros and cons | treated as separate documents | concatenated into one | §2.1 |
+
+**TF-IDF / LSA (Part A representation)**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| `min_df` | 5 documents | 2; 10 | §3.3 |
+| `max_df` | 0.85 | 0.95–1.0 (default) | §3.3 |
+| `max_features` | 8,000 | unbounded; 5,000 | §3.3 |
+| `ngram_range` | (1, 3) | (1, 1); (1, 2) | §3.3 |
+| `sublinear_tf` | True | False (default) | §3.3 |
+| LSA `n_components` (per field) | 100 | 10–30 (textbook elbow); 200 | §3.4.2 |
+
+**Anomaly detection (Part A analysis)**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| Primary detector | Isolation Forest on 200-dim LSA | LOF; One-Class SVM | §5.1 |
+| `contamination` | 0.05 | 0.01; 0.10 | §5.1 |
+| Secondary signal | Rating–Text Divergence (RTD) | absolute residual; classifier disagreement | §5.2 |
+| Composite weights (iForest / RTD) | 60 / 40 | 50 / 50; 70 / 30 | §5.2 |
+| Top-anomaly threshold | top 5% | top 1%; top 10% | §5.3 |
+
+**BERTopic stack (Part B representation + analysis)**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| Sentence encoder | `all-MiniLM-L6-v2` (384-dim) | `all-mpnet-base-v2` (768-dim) | §8.1 |
+| UMAP `n_neighbors` | 15 | 5 (default); 50 | §8.1 |
+| UMAP `n_components` | 5 | 2 (visualisation); 10 | §8.1 |
+| UMAP `min_dist` | 0.0 | 0.1 (default) | §8.1 |
+| UMAP `metric` | cosine | euclidean (default) | §8.1 |
+| HDBSCAN `min_cluster_size` | 200 (≈0.13% of sample) | 15 (small-corpus); 500 | §8.1 |
+| HDBSCAN `min_samples` | 25 | =`min_cluster_size`; 5 | §8.1 |
+| HDBSCAN `cluster_selection_method` | `eom` | `leaf` | §8.1 |
+| BERTopic `nr_topics` | `auto` | fixed integer (e.g. 20) | §8.1 |
+| BERTopic `top_n_words` | 10 | 5 (default) | §8.1 |
+
+**Log-ratio shift analysis (Part B confirmation)**
+
+| Decision | Choice made | Alternative | Where justified |
+|---|---|---|---|
+| Comparison split | pre-COVID (2008–2019) vs COVID (2020–2021) | pre-2020 vs 2020+; 2019 vs 2020 | §8.4 |
+| Smoothing constant | ε floor (1e-8) for log-zero stability | Laplace +1; Lidstone +0.5 | §8.4 |
+| Min term frequency for inclusion | per-document frequency ≥ 1e-4 (≈15 occurrences) | ≥ 10; ≥ 100 | §8.4 |
+| Top-shift display | top 25 rising + top 25 falling | top 10 each; top 50 each | §8.4 |
+
+The table is read alongside the limitations in §10.1: many of the limitations there correspond to choices in this table that would be the natural targets of a sensitivity audit. The robustness analysis in §3.1 demonstrates the sample-size row is stable; the LSA scree analysis in §3.4.2 demonstrates the `n_components` row is stable around k = 100; the cross-tabulation in §6 partly addresses the composite-weights row by showing that 60/40 vs 50/50 produces the same firm rankings on the top-decile cohort. The remaining rows are documented choices but have not been re-run under alternative settings — extending the analysis to a full cross-row sensitivity audit is the most natural next step for any operational deployment.
+
+## Use of AI Tools
+
+AI assistance was used in the preparation of this submission. Specifically, **Claude (Anthropic, claude-sonnet-4-6)** was used via the Claude Code interface to assist with:
+
+- **Prose revise**: revising the analytical commentary, including the motivation for methodological choices (TF-IDF parameters, LSA dimensionality, BERTopic hyperparameters, HDBSCAN min_cluster_size).
+- **Code review**: identifying logical issues in the analysis pipeline (e.g., unequal sampling, duplicate imports, missing prose for code cells) and suggesting corrections.
+
+The use of AI assistance was limited to the above tasks. All code was written and executed by the author, and all analytical insights were derived from the data independently of AI input. The AI was used as a tool for improving clarity and rigor in the presentation of the analysis, not for generating original content or insights.

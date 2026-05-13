@@ -1,0 +1,24 @@
+# Raw data (too large for GitHub — see README for download link)
+glassdoor_reviews.csv
+df.csv
+*.csv.zip
+
+# Quarto / Jupyter caches
+.jupyter_cache/
+.quarto/
+_freeze/
+*_files/
+
+# HTML zip (the .html itself is committed)
+60775.html.zip
+
+# macOS / editor noise
+.DS_Store
+.Rhistory
+.claude/
+.ipynb_checkpoints/
+
+# Old / unrelated
+Interactive-1.html
+Interactive-1.ipynb
+"README (1).md"
