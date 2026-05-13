@@ -19,9 +19,9 @@ at the end.
 | Stage | Technique | §  |
 |---|---|---|
 | 1. EDA overview | Rating / temporal / company / industry distributions | §1 |
-| 2. Stratified sampling | 15-strata (period × rating) proportional design, n = 150,000 | §3.1 |
-| 3. Text preprocessing | spaCy lemmatisation + domain stoplist; length & compression stats | §3.2 |
-| 4. Vectorisation | TF-IDF (min_df=5, max_df=0.85, max_features=8000, ngrams 1–3), separate fits for pros / cons | §3.3 |
+| 2. Stratified sampling | 15-strata proportional design, n = 150,000 | §3.1 |
+| 3. Text preprocessing | stopword removal + spaCy lemmatisation | §3.2 |
+| 4. Vectorisation | TF-IDF, separate fits for pros / cons | §3.3 |
 | 5. Dimensionality reduction | TruncatedSVD → 100 dims per field; hstack → 200 dims; double L2 normalisation | §3.4 |
 | 6. Semantic-space structure | 3-D LSA projection coloured by rating / period / company type | §3.5 |
 | 7. Firm similarity | Centroid cosine similarity in 200-dim joint LSA space | §4 |
