@@ -54,7 +54,7 @@ A Quarto installation is also required (https://quarto.org).
 quarto render 60775.qmd
 ```
 
-First run takes ~30–45 minutes (BERTopic embedding + HDBSCAN are the
+First run takes ~10 minutes (BERTopic embedding + HDBSCAN are the
 bottlenecks). Subsequent renders use the Jupyter cache.
 
 ## Viewing the rendered HTML
